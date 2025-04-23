@@ -7,11 +7,6 @@ import ccxt
 import plotly.graph_objects as go
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-import time
 import streamlit.components.v1 as components
 
 st.set_page_config(
@@ -28,29 +23,8 @@ def play_sound():
         </audio>
     ''', unsafe_allow_html=True)
 
-    options = webdriver.ChromeOptions()
-    options.add_argument('--headless')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--no-sandbox')
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    try:
-        time.sleep(3)
-        driver.find_element(By.XPATH, "//input[@type='text']").send_keys(username)
-        driver.find_element(By.XPATH, "//input[@type='password']").send_keys(password)
-        driver.find_element(By.XPATH, "//button").click()
-        time.sleep(5)
-        if "#/pages" not in driver.current_url:
-            return None, "Login failed or redirected unexpectedly."
-        time.sleep(5)
-        elements = driver.find_elements(By.CLASS_NAME, "coin-price")
-        prices = [el.text for el in elements if el.text.strip()]
-        return prices, None
-    except Exception as e:
-        return None, str(e)
-    finally:
-        driver.quit()
-
 st.title("📡 Local Crypto Alert App")
+st.caption("Desktop-only app with predictions and live indicators")
 
 default_coins = ["BTC", "ETH", "SOL", "XRP", "DOGE", "MATIC"]
 custom_coin = st.text_input("➕ Add Custom Coin (e.g. ADA)", key="custom_coin_input")
@@ -64,6 +38,7 @@ if st.button("🔄 Refresh Prediction"):
 
 symbol_full = f"{symbol}/USDT"
 exchange = ccxt.kraken()
+
 try:
     exchange.load_markets()
     ohlcv = exchange.fetch_ohlcv(symbol_full, "5m", limit=100)
@@ -97,25 +72,16 @@ try:
         play_sound()
     else:
         st.info("No alert triggered.")
+
     with st.expander("📊 View Chart"):
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"], name="Close"))
         fig.add_trace(go.Scatter(x=df["timestamp"], y=df["sma"], name="SMA", line=dict(dash="dot")))
         fig.add_trace(go.Scatter(x=df["timestamp"], y=df["ema"], name="EMA", line=dict(dash="dot")))
         st.plotly_chart(fig, use_container_width=True)
+
 except Exception as e:
     st.error(f"Failed to load data for {symbol_full}: {e}")
-
-            with st.spinner("Logging in and retrieving market prices..."):
-                if error:
-                    st.error(f"❌ {error}")
-                elif prices:
-                    for price in prices:
-                        st.write(price)
-                else:
-                    st.warning("No data found.")
-        else:
-            st.warning("Please enter both username and password.")
 
 # Gold price ticker and market news feed
 st.markdown("### 🟡 Gold Price Ticker (USD)")
