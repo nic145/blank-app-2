@@ -12,9 +12,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 import time
+import streamlit.components.v1 as components
 
 st.set_page_config(
-    page_title="📱 Mobile Crypto Alerts",
+    page_title="📱 Local Crypto Alerts",
     layout="centered",
     initial_sidebar_state="collapsed"
 )
@@ -27,16 +28,12 @@ def play_sound():
         </audio>
     ''', unsafe_allow_html=True)
 
-def fwvp_login_and_fetch(username, password):
     options = webdriver.ChromeOptions()
     options.add_argument('--headless')
     options.add_argument('--disable-gpu')
     options.add_argument('--no-sandbox')
-
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-
     try:
-        driver.get("https://wap.fwvpgroup.co/#/pages/login/login")
         time.sleep(3)
         driver.find_element(By.XPATH, "//input[@type='text']").send_keys(username)
         driver.find_element(By.XPATH, "//input[@type='password']").send_keys(password)
@@ -44,7 +41,6 @@ def fwvp_login_and_fetch(username, password):
         time.sleep(5)
         if "#/pages" not in driver.current_url:
             return None, "Login failed or redirected unexpectedly."
-        driver.get("https://wap.fwvpgroup.co/#/pages/market/market")
         time.sleep(5)
         elements = driver.find_elements(By.CLASS_NAME, "coin-price")
         prices = [el.text for el in elements if el.text.strip()]
@@ -54,10 +50,8 @@ def fwvp_login_and_fetch(username, password):
     finally:
         driver.quit()
 
-st.title("📡 Crypto Signal Monitor")
-st.caption("Live scalping alerts — optimized for mobile")
+st.title("📡 Local Crypto Alert App")
 
-# Default + custom coins
 default_coins = ["BTC", "ETH", "SOL", "XRP", "DOGE", "MATIC"]
 custom_coin = st.text_input("➕ Add Custom Coin (e.g. ADA)", key="custom_coin_input")
 coin_list = default_coins + ([custom_coin.upper()] if custom_coin and custom_coin.upper() not in default_coins else [])
@@ -112,21 +106,26 @@ try:
 except Exception as e:
     st.error(f"Failed to load data for {symbol_full}: {e}")
 
-# FWVP Login sidebar
-with st.sidebar.expander("🔐 FWVP Login"):
-    fwvp_user = st.text_input("Username", key="fwvp_user")
-    fwvp_pass = st.text_input("Password", type="password", key="fwvp_pass")
-    if st.button("Login & Fetch FWVP Data"):
-        if fwvp_user and fwvp_pass:
             with st.spinner("Logging in and retrieving market prices..."):
-                prices, error = fwvp_login_and_fetch(fwvp_user, fwvp_pass)
                 if error:
                     st.error(f"❌ {error}")
                 elif prices:
-                    st.success("✅ FWVP Data Fetched")
                     for price in prices:
                         st.write(price)
                 else:
                     st.warning("No data found.")
         else:
             st.warning("Please enter both username and password.")
+
+# Gold price ticker and market news feed
+st.markdown("### 🟡 Gold Price Ticker (USD)")
+components.html("""
+    <iframe src="https://goldbroker.com/widget/live-price/gold/1?currency=USD" 
+            width="100%" height="60" frameborder="0" scrolling="no"></iframe>
+""", height=60)
+
+st.markdown("### 🗞️ Market News Feed")
+components.html("""
+    <iframe src="https://rss.app/embed/v1/wall/your_widget_id" 
+            width="100%" height="600" frameborder="0" scrolling="no"></iframe>
+""", height=600)
