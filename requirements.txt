@@ -4,3 +4,5 @@ numpy
 plotly
 ccxt
 scikit-learn
+selenium
+webdriver-manager
