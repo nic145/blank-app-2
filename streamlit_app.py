@@ -1,117 +1,129 @@
+# streamlit_app.py
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import mplfinance as mpf
+import pytz
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import mplfinance as mpf
 
-# ==========================
-# Utility Functions
-# ==========================
+# Must be first
+st.set_page_config(page_title="Crypto Predictor", layout="wide")
 
-def fetch_ohlc_data(pair="BTC/USD", interval="60", since=None):
-    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"
-    if since:
-        url += f"&since={since}"
-    response = requests.get(url)
-    data = response.json()
+# Sidebar - Timezone selector
+timezones = pytz.all_timezones
+selected_tz = st.sidebar.selectbox("Select your time zone", ["UTC"] + sorted(timezones))
+local_tz = pytz.timezone(selected_tz)
 
-    if not data["error"]:
-        key = list(data["result"].keys())[0]
-        df = pd.DataFrame(data["result"][key], columns=[
-            "time", "open", "high", "low", "close", "vwap", "volume", "count"])
-        df["time"] = pd.to_datetime(df["time"], unit='s')
-        df.set_index("time", inplace=True)
-        df = df.astype(float)
-        return df
-    return pd.DataFrame()
+# Constants
+KRAKEN_API_URL = "https://api.kraken.com/0/public/OHLC"
+ASSET_PAIR = "XBTUSD"
+INTERVAL_MAP = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+DEFAULT_INTERVAL = "1h"
+REFRESH_INTERVAL_MIN = 1
 
-def add_indicators(df, sma=True, ema=True):
-    if sma:
-        df["SMA_20"] = df["close"].rolling(window=20).mean()
-    if ema:
-        df["EMA_20"] = df["close"].ewm(span=20, adjust=False).mean()
+# Global state
+if "last_refreshed" not in st.session_state:
+    st.session_state.last_refreshed = datetime.utcnow()
+
+# Fetch Kraken OHLC data
+@st.cache_data(ttl=REFRESH_INTERVAL_MIN * 60)
+def fetch_ohlc(pair="XBTUSD", interval=60):
+    params = {"pair": pair, "interval": interval}
+    response = requests.get(KRAKEN_API_URL, params=params).json()
+    result = list(response["result"].values())[0]
+    df = pd.DataFrame(result, columns=[
+        "time", "open", "high", "low", "close", "vwap", "volume", "count"
+    ])
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df.set_index("time", inplace=True)
+    df = df.astype(float)
     return df
 
-def generate_predictions(df):
-    df = df.dropna()
+# Predict future price
+def predict(df):
     df["target"] = df["close"].shift(-1)
-    X = df[["open", "high", "low", "close", "volume"]].values[:-1]
-    y = df["target"].values[:-1]
-    model = RandomForestRegressor()
+    df.dropna(inplace=True)
+    X = df[["open", "high", "low", "close", "volume"]]
+    y = df["target"]
+
+    if len(X) != len(y):
+        min_len = min(len(X), len(y))
+        X = X.iloc[:min_len]
+        y = y.iloc[:min_len]
+
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X, y)
-    prediction = model.predict([df[["open", "high", "low", "close", "volume"]].values[-1]])[0]
-    return prediction
 
-def generate_scalp_signals(df, threshold=0.10):
-    df["scalp_signal"] = np.where(df["close"].pct_change() > threshold, "SELL",
-                           np.where(df["close"].pct_change() < -threshold, "BUY", "HOLD"))
-    return df
+    current = df[["open", "high", "low", "close", "volume"]].iloc[-1].values.reshape(1, -1)
+    predicted_price = model.predict(current)[0]
+    predicted_time = df.index[-1] + timedelta(minutes=INTERVAL_MAP[selected_interval])
+    return predicted_price, predicted_time
 
-# ==========================
-# Streamlit UI
-# ==========================
+# Buy/Sell/Hold signal
+def get_signal(current_price, predicted_price):
+    change = (predicted_price - current_price) / current_price
+    if change > 0.10:
+        return "BUY"
+    elif change < -0.10:
+        return "SELL"
+    else:
+        return "HOLD"
 
-st.set_page_config(layout="wide")
-st.title("📊 Crypto Dashboard with Live Charts")
+# Interface
+st.title("📈 Live Crypto Dashboard")
+st.markdown("Made with ❤️ using Kraken API")
 
-# Coin and interval selection
-pair = st.selectbox("Choose trading pair:", ["BTC/USD", "ETH/USD", "ADA/USD"])
-interval = st.radio("Select interval for candlestick chart:", ["1", "5", "15", "60", "240", "1440"], horizontal=True)
-refresh = st.button("🔄 Refresh All Charts")
-prediction_refresh = st.button("🔁 Refresh Prediction")
+selected_interval = st.radio("Select Interval", list(INTERVAL_MAP.keys()), index=list(INTERVAL_MAP).index(DEFAULT_INTERVAL), horizontal=True)
 
-# Technical Indicator toggles
-col1, col2, col3 = st.columns(3)
-with col1:
-    show_sma = st.toggle("Show SMA", value=True)
-with col2:
-    show_ema = st.toggle("Show EMA", value=True)
-with col3:
-    scalp_threshold = st.slider("Scalp threshold (%)", min_value=0.10, max_value=0.35, value=0.10, step=0.01)
+df = fetch_ohlc(ASSET_PAIR, INTERVAL_MAP[selected_interval])
 
-# ==========================
-# Data Fetching and Display
-# ==========================
+# Chart 1: Candlestick
+st.subheader(f"Candlestick Chart - BTC/USD ({selected_interval})")
+mpf_plot = mpf.plot(df[-60:], type='candle', style='charles', volume=False, returnfig=True)
+st.pyplot(mpf_plot[0])
 
-df = fetch_ohlc_data(pair.replace("/", ""), interval)
-if df.empty:
-    st.error("Failed to fetch data.")
-else:
-    current_price = df["close"].iloc[-1]
-    last_updated = df.index[-1].strftime("%Y-%m-%d %H:%M:%S")
-    st.subheader(f"💰 Current Price: {current_price:.2f} {pair.split('/')[1]}  |  Last Update: {last_updated}")
+# Compute EMA/SMA
+st.subheader("Price & Prediction Comparison")
+show_sma = st.checkbox("Show SMA", value=True)
+show_ema = st.checkbox("Show EMA", value=True)
+sma = df["close"].rolling(window=10).mean()
+ema = df["close"].ewm(span=10).mean()
 
-    # Top: Candlestick chart
-    st.markdown("### 🕯️ Candlestick Chart")
-    mpf_fig = mpf.figure(style='charles', figsize=(12, 6))
-    mpf.plot(df, type='candle', ax=mpf_fig.gca(), volume=False)
-    st.pyplot(mpf_fig)
+plt.figure(figsize=(12, 5))
+plt.plot(df.index, df["close"], label="Actual Price")
+if show_sma:
+    plt.plot(sma.index, sma, label="SMA (10)")
+if show_ema:
+    plt.plot(ema.index, ema, label="EMA (10)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+st.pyplot(plt)
 
-    # Mid: Line chart with indicators
-    st.markdown("### 📈 Price Chart with Indicators")
-    df = add_indicators(df, show_sma, show_ema)
-    df = generate_scalp_signals(df, threshold=scalp_threshold)
+# Prediction
+predicted_price, predicted_time = predict(df)
+local_pred_time = predicted_time.astimezone(local_tz).strftime('%Y-%m-%d %I:%M:%S %p %Z')
+local_now = datetime.now(pytz.utc).astimezone(local_tz).strftime('%Y-%m-%d %I:%M:%S %p %Z')
 
-    chart_df = df[["close"]].copy()
-    if show_sma:
-        chart_df["SMA_20"] = df["SMA_20"]
-    if show_ema:
-        chart_df["EMA_20"] = df["EMA_20"]
+current_price = df["close"].iloc[-1]
+signal = get_signal(current_price, predicted_price)
 
-    st.line_chart(chart_df)
+# Price Display
+st.subheader("🔮 Price Prediction")
+st.metric("Predicted Price", f"${predicted_price:,.2f}", delta=f"{(predicted_price - current_price):.2f}")
+st.metric("Current Price", f"${current_price:,.2f}")
+st.write(f"**Prediction Time:** {local_pred_time}")
+st.write(f"**Last Updated:** {local_now}")
+st.write(f"**Signal:** `{signal}`")
 
-    # Bottom: Prediction chart
-    st.markdown("### 🤖 Predicted Price vs Actual Price")
-    predicted_price = generate_predictions(df)
-    prediction_time = (df.index[-1] + timedelta(minutes=int(interval))).strftime("%Y-%m-%d %H:%M:%S")
-
-    pred_df = pd.DataFrame({
-        "Actual": [df["close"].iloc[-1]],
-        "Predicted": [predicted_price]
-    }, index=[prediction_time])
-    st.line_chart(pred_df)
-
-    st.success(f"📍 Predicted price at {prediction_time}: {predicted_price:.2f} {pair.split('/')[1]}")
-
+# Buttons
+col1, col2 = st.columns(2)
+if col1.button("🔁 Refresh Charts"):
+    st.cache_data.clear()
+    st.rerun()
+if col2.button("📈 Refresh Prediction"):
+    st.rerun()
