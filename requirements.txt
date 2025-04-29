@@ -3,5 +3,4 @@ pandas
 numpy
 requests
 scikit-learn
-matplotlib
 pytz

@@ -1,145 +1,128 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import krakenex
-from sklearn.ensemble import RandomForestRegressor
+import requests
 from datetime import datetime, timedelta
+from sklearn.ensemble import RandomForestRegressor
+import pytz
 
-# --- Kraken API Setup ---
-k = krakenex.API()
+# ========== Settings ==========
+COINS = {
+    "BTC": "XBTUSD",
+    "ETH": "ETHUSD",
+    "ADA": "ADAUSD",
+    "XRP": "XRPUSD",
+    "SOL": "SOLUSD",
+    "ETC": "ETCUSD"
+}
+TIMEZONE = 'US/Eastern'  # Change to your local timezone
 
-# --- Functions ---
-def fetch_ohlcv(symbol, interval, lookback_days=30):
-    pair = f"{symbol}USD"
-    since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1e9)
+# ========== Utility Functions ==========
+
+@st.cache_data(ttl=300)
+def fetch_ohlc(coin_pair, interval='60'):
+    url = f'https://api.kraken.com/0/public/OHLC?pair={coin_pair}&interval={interval}'
+    response = requests.get(url).json()
     try:
-        ohlc_data = k.query_public('OHLC', {'pair': pair, 'interval': interval, 'since': since})
-        result = list(ohlc_data['result'].values())[0]
-        df = pd.DataFrame(result, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+        key = list(response['result'].keys())[0]
+        df = pd.DataFrame(response['result'][key],
+                          columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
         df['time'] = pd.to_datetime(df['time'], unit='s')
         df['close'] = df['close'].astype(float)
         return df
-    except Exception as e:
-        st.error(f"Error fetching OHLCV data: {e}")
+    except:
         return None
 
-def add_indicators(df):
-    df['SMA_20'] = df['close'].rolling(window=20).mean()
-    df['SMA_50'] = df['close'].rolling(window=50).mean()
-    df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
+def get_latest_price(df):
+    return df['close'].iloc[-1] if df is not None else None
 
-    df['signal'] = 0
-    df.loc[df['EMA_20'] > df['EMA_50'], 'signal'] = 1
-    df.loc[df['EMA_20'] < df['EMA_50'], 'signal'] = -1
+def calculate_indicators(df):
+    df['SMA_20'] = df['close'].rolling(window=20).mean()
+    df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
     return df
 
-def predict_next(df):
-    df['returns'] = df['close'].pct_change()
-    df = df.dropna()
-    X = df[['returns']]
-    y = df['close']
-    model = RandomForestRegressor(n_estimators=100)
-    model.fit(X, y)
-    latest_return = df['returns'].iloc[-1]
-    prediction = model.predict(np.array([[latest_return]]))[0]
-    return prediction
-
-def calculate_gain_percentages(df):
-    trades = []
-    last_buy_price = None
+def generate_signals(df, gain_thresh):
+    signals = []
     for i in range(1, len(df)):
-        if df.iloc[i]['signal'] == 1 and last_buy_price is None:
-            last_buy_price = df.iloc[i]['close']
-            buy_time = df.iloc[i]['time']
-        elif df.iloc[i]['signal'] == -1 and last_buy_price is not None:
-            sell_price = df.iloc[i]['close']
-            sell_time = df.iloc[i]['time']
-            gain = ((sell_price - last_buy_price) / last_buy_price) * 100
-            trades.append({'buy_time': buy_time, 'sell_time': sell_time, 'gain': gain})
-            last_buy_price = None
-    return trades
+        gain = (df['close'].iloc[i] - df['close'].iloc[i-1]) / df['close'].iloc[i-1]
+        if gain >= gain_thresh:
+            signals.append("SELL")
+        elif gain <= -gain_thresh:
+            signals.append("BUY")
+        else:
+            signals.append("")
+    signals.insert(0, "")
+    df['Signal'] = signals
+    return df
 
-# --- Streamlit UI ---
-st.set_page_config(page_title="Kraken Crypto Scalper", layout="wide")
-st.title("🚀 Kraken Crypto Scalper")
+def predict_prices(df):
+    df = df.dropna().copy()
+    df['return'] = df['close'].pct_change()
+    df.dropna(inplace=True)
 
-coins = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'ETC']
-selected_coin = st.selectbox("Choose a cryptocurrency:", coins)
+    for lag in range(1, 6):
+        df[f'lag_{lag}'] = df['return'].shift(lag)
 
-# Timeframe selection
-interval_map = {"1 Hour": "60", "4 Hours": "240", "1 Day": "1440"}
-selected_tf = st.selectbox("Timeframe:", list(interval_map.keys()))
-interval = interval_map[selected_tf]
+    df.dropna(inplace=True)
 
-# SMA/EMA Toggles
-col1, col2, col3, col4 = st.columns(4)
-show_sma20 = col1.toggle("Show SMA 20", True)
-show_sma50 = col2.toggle("Show SMA 50", False)
-show_ema20 = col3.toggle("Show EMA 20", True)
-show_ema50 = col4.toggle("Show EMA 50", False)
+    X = df[[f'lag_{i}' for i in range(1, 6)]]
+    y = df['close']
 
-# Buttons
-refresh_data = st.button("🔁 Refresh Price Data")
-refresh_prediction = st.button("🎯 Refresh Prediction")
-show_gains = st.toggle("📊 Show Gain % Between Trades", value=False)
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X, y)
 
-# --- Fetch or refresh data ---
-if 'price_data' not in st.session_state or refresh_data or st.session_state.get('last_interval') != interval:
-    df = fetch_ohlcv(selected_coin, interval)
-    if df is not None:
-        df = add_indicators(df)
-        st.session_state['price_data'] = df
-        st.session_state['last_interval'] = interval
+    last_data = X.iloc[-1].values.reshape(1, -1)
+    predictions = {}
+
+    for minutes_ahead in [15, 30, 60]:
+        future_time = datetime.now(pytz.timezone(TIMEZONE)) + timedelta(minutes=minutes_ahead)
+        future_price = model.predict(last_data)[0]
+        predictions[minutes_ahead] = (future_price, future_time.strftime('%Y-%m-%d %I:%M %p %Z'))
+
+    return predictions
+
+# ========== Streamlit App ==========
+
+st.set_page_config(page_title="Crypto Streamlit AI", layout="wide")
+
+st.title("🧠 Crypto Price AI + Scalp Signals")
+st.markdown("Made with ❤️ using Kraken + Streamlit")
+
+# Coin Selection and Gain Toggle
+coin = st.selectbox("Choose a coin:", list(COINS.keys()))
+gain_thresh = st.slider("Scalp % Gain Threshold", 0.001, 0.05, 0.01, 0.001)
+refresh_prices = st.button("🔄 Refresh Prices")
+refresh_predictions = st.button("🔁 Refresh Predictions")
+
+# Data Fetch
+pair = COINS[coin]
+df = fetch_ohlc(pair)
+
+# Price Display
+if df is not None:
+    price = get_latest_price(df)
+    local_time = datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d %I:%M %p %Z')
+    st.metric(label=f"📈 Current {coin} Price", value=f"${price:,.2f}")
+    st.caption(f"Last Updated: {local_time}")
 else:
-    df = st.session_state['price_data']
+    st.error("Failed to fetch OHLCV data.")
+    st.stop()
 
-# --- Live Price ---
-if df is not None and not df.empty:
-    latest_price = df['close'].iloc[-1]
-    st.metric(label=f"💰 Latest {selected_coin}/USD Price", value=f"${latest_price:,.2f}")
-else:
-    st.error("❌ No price data available.")
+# Add Indicators and Signals
+df = calculate_indicators(df)
+df = generate_signals(df, gain_thresh)
 
-# --- Plot Chart ---
-if df is not None and not df.empty:
-    st.subheader("📈 Price Chart")
+# Chart
+st.subheader("📊 Price Chart with SMA/EMA + Buy/Sell")
+st.line_chart(df.set_index('time')[['close', 'SMA_20', 'EMA_20']])
 
-    fig, ax = plt.subplots(figsize=(12,6))
-    ax.plot(df['time'], df['close'], label='Close', color='blue')
-    if show_sma20:
-        ax.plot(df['time'], df['SMA_20'], label='SMA 20', color='orange')
-    if show_sma50:
-        ax.plot(df['time'], df['SMA_50'], label='SMA 50', color='brown')
-    if show_ema20:
-        ax.plot(df['time'], df['EMA_20'], label='EMA 20', color='green')
-    if show_ema50:
-        ax.plot(df['time'], df['EMA_50'], label='EMA 50', color='red')
+# Signal Table
+st.dataframe(df[['time', 'close', 'Signal']].tail(10), use_container_width=True)
 
-    buy_signals = df[df['signal'] == 1]
-    sell_signals = df[df['signal'] == -1]
-    ax.scatter(buy_signals['time'], buy_signals['close'], marker='^', color='lime', label='BUY', s=100)
-    ax.scatter(sell_signals['time'], sell_signals['close'], marker='v', color='red', label='SELL', s=100)
+# Predictions
+if refresh_predictions or refresh_prices:
+    st.subheader("🔮 AI Price Predictions (Local Time)")
+    preds = predict_prices(df)
+    for k, (price, ts) in preds.items():
+        st.write(f"**{k} min** → ${price:.2f} at *{ts}*")
 
-    if show_gains:
-        trades = calculate_gain_percentages(df)
-        for trade in trades:
-            mid_time = trade['buy_time'] + (trade['sell_time'] - trade['buy_time']) / 2
-            mid_price = df[(df['time'] >= trade['buy_time']) & (df['time'] <= trade['sell_time'])]['close'].mean()
-            gain_color = 'green' if trade['gain'] > 0 else 'red'
-            ax.text(mid_time, mid_price, f"{trade['gain']:.2f}%", color=gain_color, fontsize=8, ha='center')
-
-    ax.legend()
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Price (USD)")
-    st.pyplot(fig)
-else:
-    st.warning("Please refresh to load data.")
-
-# --- Prediction ---
-if df is not None and not df.empty:
-    if 'price_prediction' not in st.session_state or refresh_prediction:
-        st.session_state['price_prediction'] = predict_next(df)
-    st.subheader("🔮 AI Price Prediction")
-    st.metric(label="Next Predicted Price", value=f"${st.session_state['price_prediction']:.2f}")
