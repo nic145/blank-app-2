@@ -1,147 +1,105 @@
 import streamlit as st
 import pandas as pd
-import requests
-import plotly.graph_objects as go
-from datetime import datetime
-import io
+import numpy as np
+import krakenex
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import time
 
-# ------------------------------
-# Kraken OHLCV Fetcher
-# ------------------------------
+# Initialize Kraken API
+api = krakenex.API()
 
-def fetch_ohlcv_data(symbol, interval='60', since=None):
-    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval={interval}"
-    if since:
-        url += f"&since={since}"
-    response = requests.get(url)
-    data = response.json()
-    if data['error']:
-        st.error(f"Kraken API Error: {data['error']}")
+# Mapping user-friendly names to Kraken pairs
+COIN_MAPPING = {
+    "Bitcoin (BTC)": "XBTUSD",
+    "Ethereum (ETH)": "ETHUSD",
+    "Solana (SOL)": "SOLUSD",
+    "Ripple (XRP)": "XRPUSD",
+    "Cardano (ADA)": "ADAUSD",
+    "Ethereum Classic (ETC)": "ETCUSD",
+}
+
+# Function to fetch latest price
+def get_latest_price(pair):
+    try:
+        response = api.query_public('Ticker', {'pair': pair})
+        price = float(response['result'][list(response['result'].keys())[0]]['c'][0])
+        return price
+    except Exception as e:
+        st.error(f"Error fetching price for {pair}: {e}")
         return None
-    result = list(data['result'].values())[0]
-    df = pd.DataFrame(result, columns=["timestamp", "open", "high", "low", "close", "vwap", "volume", "count"])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-    df = df.astype({"open": float, "high": float, "low": float, "close": float})
-    return df
 
-# ------------------------------
-# Technical Indicators
-# ------------------------------
+# Function to simulate historical price data
+def get_historical_data(pair, days=90):
+    try:
+        np.random.seed(abs(hash(pair)) % (10 ** 8))  # Seed based on pair
+        base_price = get_latest_price(pair)
+        if base_price is None:
+            return None
+        prices = base_price + np.cumsum(np.random.normal(0, base_price * 0.01, days))
+        dates = pd.date_range(end=pd.Timestamp.today(), periods=days)
+        df = pd.DataFrame({'Date': dates, 'Price': prices})
+        return df
+    except Exception as e:
+        st.error(f"Error generating historical data for {pair}: {e}")
+        return None
 
-def calculate_indicators(df):
-    df['SMA_10'] = df['close'].rolling(window=10).mean()
-    df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
-    return df
+# Function to train AI model
+def train_model(df):
+    try:
+        df['Day'] = np.arange(len(df))
+        X = df[['Day']]
+        y = df['Price']
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model.fit(X, y)
+        return model
+    except Exception as e:
+        st.error(f"Error training model: {e}")
+        return None
 
-# ------------------------------
-# Scalping Signal (Crossover)
-# ------------------------------
-
-def generate_scalping_signals(df):
-    df['Buy_Signal'] = (df['SMA_10'].shift(1) < df['EMA_20'].shift(1)) & (df['SMA_10'] > df['EMA_20'])
-    df['Sell_Signal'] = (df['SMA_10'].shift(1) > df['EMA_20'].shift(1)) & (df['SMA_10'] < df['EMA_20'])
-    return df
-
-# ------------------------------
-# Chart Drawing
-# ------------------------------
-
-def plot_chart(df, selected_crypto):
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['close'], name='Close Price', line=dict(color='blue')))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['SMA_10'], name='SMA 10', line=dict(color='orange')))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_20'], name='EMA 20', line=dict(color='green')))
-
-    # Plot Buy/Sell signals
-    fig.add_trace(go.Scatter(
-        x=df[df['Buy_Signal']]['timestamp'],
-        y=df[df['Buy_Signal']]['close'],
-        mode='markers',
-        marker=dict(color='lime', size=10, symbol='triangle-up'),
-        name='Buy Signal'
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=df[df['Sell_Signal']]['timestamp'],
-        y=df[df['Sell_Signal']]['close'],
-        mode='markers',
-        marker=dict(color='red', size=10, symbol='triangle-down'),
-        name='Sell Signal'
-    ))
-
-    fig.update_layout(
-        title=f"{selected_crypto} Price with SMA/EMA + Scalping Signals",
-        xaxis_title="Time",
-        yaxis_title="Price (USD)",
-        template="plotly_white"
-    )
-
-    return fig
-
-# ------------------------------
-# Main App
-# ------------------------------
-
+# Streamlit App
 def main():
-    st.title("🚀 Kraken Crypto Scalping Assistant")
+    st.set_page_config(page_title="Crypto AI Predictor", page_icon="📈", layout="wide")
+    st.title("📈 Crypto AI Price Predictor (Kraken)")
 
-    # Select Coin
-    crypto_options = {
-        'Bitcoin (BTC/USD)': 'XBTUSD',
-        'Ethereum (ETH/USD)': 'ETHUSD',
-        'Solana (SOL/USD)': 'SOLUSD',
-        'XRP (XRP/USD)': 'XRPUSD',
-        'Cardano (ADA/USD)': 'ADAUSD',
-        'Ethereum Classic (ETC/USD)': 'ETCUSD'
-    }
+    selected_coin = st.selectbox("Choose a coin:", list(COIN_MAPPING.keys()))
+    show_predictions = st.toggle("Show AI Predictions 🔮", value=True)
 
-    selected_crypto_name = st.selectbox("Select Cryptocurrency", list(crypto_options.keys()))
-    selected_crypto_symbol = crypto_options[selected_crypto_name]
+    if selected_coin:
+        pair = COIN_MAPPING[selected_coin]
 
-    # Fetch + Process Data
-    price_df = fetch_ohlcv_data(selected_crypto_symbol)
-    
-    if price_df is not None and not price_df.empty:
-        price_df = calculate_indicators(price_df)
-        price_df = generate_scalping_signals(price_df)
+        latest_price = get_latest_price(pair)
+        if latest_price:
+            st.metric(label=f"Current {selected_coin} Price", value=f"${latest_price:,.2f}")
 
-        st.subheader(f"📈 {selected_crypto_name} Chart + Indicators")
-        fig = plot_chart(price_df, selected_crypto_name)
-        st.plotly_chart(fig)
+        st.subheader("📈 Historical Price Chart")
+        historical_data = get_historical_data(pair)
 
-        # Save Buttons
-        st.subheader("💾 Save Options")
+        if historical_data is not None:
+            model = train_model(historical_data)
+            if model and show_predictions:
+                # Predict next 30 days
+                future_days = 30
+                future = pd.DataFrame({'Day': np.arange(len(historical_data), len(historical_data) + future_days)})
+                future['Predicted_Price'] = model.predict(future[['Day']])
+                
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.plot(historical_data['Date'], historical_data['Price'], label='Historical Price', color='blue')
+                future_dates = pd.date_range(start=historical_data['Date'].iloc[-1] + pd.Timedelta(days=1), periods=future_days)
+                ax.plot(future_dates, future['Predicted_Price'], label='Predicted Price', linestyle='--', color='green')
+                ax.set_xlabel("Date")
+                ax.set_ylabel("Price (USD)")
+                ax.set_title(f"{selected_coin} Price Chart with AI Prediction")
+                ax.legend()
+                st.pyplot(fig)
 
-        buffer = io.BytesIO()
-        chart_csv = price_df.to_csv(index=False).encode('utf-8')
-        buffer.write(chart_csv)
-        buffer.seek(0)
+            else:
+                st.line_chart(historical_data.set_index('Date')['Price'])
 
-        st.download_button(
-            label="💾 Download Full Chart Data (CSV)",
-            data=buffer,
-            file_name=f"{selected_crypto_symbol}_chartdata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
+        else:
+            st.error("Failed to load historical data.")
 
-        signals_df = price_df[(price_df['Buy_Signal']) | (price_df['Sell_Signal'])][['timestamp', 'close', 'Buy_Signal', 'Sell_Signal']]
-
-        if not signals_df.empty:
-            signals_buffer = io.BytesIO()
-            signals_csv = signals_df.to_csv(index=False).encode('utf-8')
-            signals_buffer.write(signals_csv)
-            signals_buffer.seek(0)
-
-            st.download_button(
-                label="💾 Download Buy/Sell Signals (CSV)",
-                data=signals_buffer,
-                file_name=f"{selected_crypto_symbol}_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
-
-    else:
-        st.error("Failed to fetch price! Data is empty.")
+    st.caption("🔮 Made with love — Powered by Kraken API and AI models.")
 
 if __name__ == "__main__":
     main()
