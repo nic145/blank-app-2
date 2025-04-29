@@ -2,120 +2,111 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timedelta
-import pytz
+import mplfinance as mpf
+from datetime import datetime
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
 
-# ----------------- Settings ----------------- #
-KRAKEN_API_URL = "https://api.kraken.com/0/public/OHLC"
-SUPPORTED_COINS = {
-    'BTC': 'XBTUSD',
-    'ETH': 'ETHUSD',
-    'SOL': 'SOLUSD',
-    'ADA': 'ADAUSD',
-    'XRP': 'XRPUSD',
-    'ETC': 'ETCUSD'
+# Mapping
+PAIR_MAPPING = {
+    "BTC/USD": "XBTUSD",
+    "ETH/USD": "ETHUSD",
+    "SOL/USD": "SOLUSD"
+}
+INTERVAL_MAPPING = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440
 }
 
-LOCAL_TIMEZONE = 'America/New_York'  # Change this as needed
-
-# ----------------- Helper Functions ----------------- #
-def get_ohlcv_data(pair, interval='60', since=None):
-    params = {
-        'pair': pair,
-        'interval': interval
-    }
-    if since:
-        params['since'] = since
-    response = requests.get(KRAKEN_API_URL, params=params).json()
-    result = list(response['result'].values())[0]
-    df = pd.DataFrame(result, columns=[
-        'time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'
-    ])
-    df['time'] = pd.to_datetime(df['time'], unit='s')
-    df['close'] = df['close'].astype(float)
-    df.set_index('time', inplace=True)
-    return df[['close']]
-
-def calculate_indicators(df, show_sma, show_ema):
-    if show_sma:
-        df['SMA_20'] = df['close'].rolling(window=20).mean()
-    if show_ema:
-        df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
+# Kraken OHLC fetcher
+def fetch_ohlcv(pair, interval):
+    url = "https://api.kraken.com/0/public/OHLC"
+    params = {"pair": pair, "interval": interval}
+    response = requests.get(url, params=params)
+    data = response.json()
+    result = list(data["result"].values())[0]
+    df = pd.DataFrame(result, columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"])
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df.set_index("time", inplace=True)
+    df = df.astype(float)
     return df
 
-def generate_predictions(df):
-    df['return'] = df['close'].pct_change().shift(-1)
-    df = df.dropna()
+def add_indicators(df, show_sma, show_ema):
+    if show_sma:
+        df["SMA_50"] = df["close"].rolling(window=50).mean()
+    if show_ema:
+        df["EMA_50"] = df["close"].ewm(span=50).mean()
+    return df
 
-    df['hour'] = df.index.hour
-    df['dayofweek'] = df.index.dayofweek
-
-    X = df[['close', 'hour', 'dayofweek']]
-    y = df['return']
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
+def predict_price(df):
+    df = df.copy()
+    df["target"] = df["close"].shift(-1)
+    df.dropna(inplace=True)
+    X = df[["open", "high", "low", "close", "volume"]]
+    y = df["target"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False)
+    model = RandomForestRegressor()
     model.fit(X_train, y_train)
+    future_price = model.predict([X.iloc[-1].values])[0]
+    return future_price
 
-    last_row = df.iloc[[-1]]
-    pred = model.predict(last_row[['close', 'hour', 'dayofweek']])[0]
+# App config
+st.set_page_config(layout="wide")
+st.title("📈 Live Crypto Dashboard (Kraken)")
 
-    gain = pred * 100
-    now_local = datetime.now(pytz.timezone(LOCAL_TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S %Z')
+# Sidebar
+pair_name = st.sidebar.selectbox("Select Pair", list(PAIR_MAPPING.keys()))
+interval_label = st.sidebar.radio("Chart Interval", list(INTERVAL_MAPPING.keys()), index=3)
+interval = INTERVAL_MAPPING[interval_label]
+show_sma = st.sidebar.checkbox("Show SMA (50)", True)
+show_ema = st.sidebar.checkbox("Show EMA (50)", True)
+scalp_min = st.sidebar.slider("Min Gain %", 10, 15, 10)
+scalp_max = st.sidebar.slider("Max Gain %", 10, 15, 15)
+refresh = st.sidebar.button("🔄 Refresh Now")
 
-    recommendation = "HOLD"
-    if gain >= 10 and gain <= 15:
-        recommendation = "BUY (Scalp)"
-    elif gain <= -10 and gain >= -15:
-        recommendation = "SELL (Scalp)"
+# Data
+pair = PAIR_MAPPING[pair_name]
+df = fetch_ohlcv(pair, interval)
+df = add_indicators(df, show_sma, show_ema)
+current_price = df["close"].iloc[-1]
+predicted_price = predict_price(df)
+local_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    return {
-        "prediction": round(last_row['close'].values[0] * (1 + pred), 2),
-        "gain_percent": round(gain, 2),
-        "recommendation": recommendation,
-        "timestamp": now_local
-    }
+# Display info
+st.markdown(f"### {pair_name} Current Price: **${current_price:.2f}**")
+st.markdown(f"**Predicted Price (next step):** ${predicted_price:.2f} @ {local_time}")
+st.markdown(f"**Last Updated:** {local_time}")
 
-# ----------------- Streamlit UI ----------------- #
-st.set_page_config(page_title="Crypto Predictor", layout="wide")
+# Scalp suggestion
+scalp_min_price = current_price * (1 + scalp_min / 100)
+scalp_max_price = current_price * (1 + scalp_max / 100)
+st.markdown(f"💡 Scalping Zone: **${scalp_min_price:.2f} - ${scalp_max_price:.2f}**")
 
-st.title("💸 Crypto Price Dashboard + AI Prediction")
-st.markdown(f"**Timezone:** {LOCAL_TIMEZONE}")
+# Indicator Chart
+st.subheader("📊 Line Chart with Indicators")
+line_df = df[["close"]]
+if show_sma:
+    line_df["SMA_50"] = df["SMA_50"]
+if show_ema:
+    line_df["EMA_50"] = df["EMA_50"]
+st.line_chart(line_df)
 
-selected_coin = st.selectbox("Choose a coin:", list(SUPPORTED_COINS.keys()))
-pair = SUPPORTED_COINS[selected_coin]
+# Prediction comparison
+st.subheader("📈 Actual vs Predicted")
+compare_df = df[["close"]].copy()
+compare_df["predicted"] = np.nan
+compare_df.iloc[-1, compare_df.columns.get_loc("predicted")] = predicted_price
+st.line_chart(compare_df)
 
-show_sma = st.checkbox("📊 Show SMA (20)", value=True)
-show_ema = st.checkbox("📈 Show EMA (20)", value=True)
+# Candlestick chart
+st.subheader("🕯️ Candlestick Chart")
+mpf_df = df[["open", "high", "low", "close", "volume"]]
+mpf.plot(mpf_df, type='candle', style='charles', title=pair_name, ylabel='Price', volume=True)
 
-refresh = st.button("🔁 Refresh Data")
-predict_now = st.button("🎯 Refresh Prediction")
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data():
-    return get_ohlcv_data(pair)
-
-if refresh:
-    st.cache_data.clear()
-df = load_data()
-
-if df.empty:
-    st.error("Failed to load data.")
-else:
-    current_price = df['close'].iloc[-1]
-    st.subheader(f"💰 {selected_coin} Current Price: ${current_price:.2f}")
-    st.markdown(f"**Last update:** {datetime.now(pytz.timezone(LOCAL_TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
-    df = calculate_indicators(df, show_sma, show_ema)
-
-    st.line_chart(df)
-
-    if predict_now:
-        pred_info = generate_predictions(df)
-        st.success(f"📈 **Predicted Price:** ${pred_info['prediction']}")
-        st.info(f"📊 Gain: {pred_info['gain_percent']}% — {pred_info['recommendation']}")
-        st.caption(f"🕒 Prediction Time: {pred_info['timestamp']}")
+# Global refresh
+if not refresh:
+    st.experimental_rerun()

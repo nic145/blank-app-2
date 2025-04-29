@@ -1,6 +1,6 @@
 streamlit
 pandas
 numpy
-scikit-learn
 requests
-pytz
+scikit-learn
+mplfinance
