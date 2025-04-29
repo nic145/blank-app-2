@@ -3,126 +3,119 @@ import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime, timedelta
-from sklearn.ensemble import RandomForestRegressor
 import pytz
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
 
-# ========== Settings ==========
-COINS = {
-    "BTC": "XBTUSD",
-    "ETH": "ETHUSD",
-    "ADA": "ADAUSD",
-    "XRP": "XRPUSD",
-    "SOL": "SOLUSD",
-    "ETC": "ETCUSD"
+# ----------------- Settings ----------------- #
+KRAKEN_API_URL = "https://api.kraken.com/0/public/OHLC"
+SUPPORTED_COINS = {
+    'BTC': 'XBTUSD',
+    'ETH': 'ETHUSD',
+    'SOL': 'SOLUSD',
+    'ADA': 'ADAUSD',
+    'XRP': 'XRPUSD',
+    'ETC': 'ETCUSD'
 }
-TIMEZONE = 'US/Eastern'  # Change to your local timezone
 
-# ========== Utility Functions ==========
+LOCAL_TIMEZONE = 'America/New_York'  # Change this as needed
 
-@st.cache_data(ttl=300)
-def fetch_ohlc(coin_pair, interval='60'):
-    url = f'https://api.kraken.com/0/public/OHLC?pair={coin_pair}&interval={interval}'
-    response = requests.get(url).json()
-    try:
-        key = list(response['result'].keys())[0]
-        df = pd.DataFrame(response['result'][key],
-                          columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df['close'] = df['close'].astype(float)
-        return df
-    except:
-        return None
+# ----------------- Helper Functions ----------------- #
+def get_ohlcv_data(pair, interval='60', since=None):
+    params = {
+        'pair': pair,
+        'interval': interval
+    }
+    if since:
+        params['since'] = since
+    response = requests.get(KRAKEN_API_URL, params=params).json()
+    result = list(response['result'].values())[0]
+    df = pd.DataFrame(result, columns=[
+        'time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'
+    ])
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df['close'] = df['close'].astype(float)
+    df.set_index('time', inplace=True)
+    return df[['close']]
 
-def get_latest_price(df):
-    return df['close'].iloc[-1] if df is not None else None
-
-def calculate_indicators(df):
-    df['SMA_20'] = df['close'].rolling(window=20).mean()
-    df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
+def calculate_indicators(df, show_sma, show_ema):
+    if show_sma:
+        df['SMA_20'] = df['close'].rolling(window=20).mean()
+    if show_ema:
+        df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
     return df
 
-def generate_signals(df, gain_thresh):
-    signals = []
-    for i in range(1, len(df)):
-        gain = (df['close'].iloc[i] - df['close'].iloc[i-1]) / df['close'].iloc[i-1]
-        if gain >= gain_thresh:
-            signals.append("SELL")
-        elif gain <= -gain_thresh:
-            signals.append("BUY")
-        else:
-            signals.append("")
-    signals.insert(0, "")
-    df['Signal'] = signals
-    return df
+def generate_predictions(df):
+    df['return'] = df['close'].pct_change().shift(-1)
+    df = df.dropna()
 
-def predict_prices(df):
-    df = df.dropna().copy()
-    df['return'] = df['close'].pct_change()
-    df.dropna(inplace=True)
+    df['hour'] = df.index.hour
+    df['dayofweek'] = df.index.dayofweek
 
-    for lag in range(1, 6):
-        df[f'lag_{lag}'] = df['return'].shift(lag)
+    X = df[['close', 'hour', 'dayofweek']]
+    y = df['return']
 
-    df.dropna(inplace=True)
-
-    X = df[[f'lag_{i}' for i in range(1, 6)]]
-    y = df['close']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
     model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X, y)
+    model.fit(X_train, y_train)
 
-    last_data = X.iloc[-1].values.reshape(1, -1)
-    predictions = {}
+    last_row = df.iloc[[-1]]
+    pred = model.predict(last_row[['close', 'hour', 'dayofweek']])[0]
 
-    for minutes_ahead in [15, 30, 60]:
-        future_time = datetime.now(pytz.timezone(TIMEZONE)) + timedelta(minutes=minutes_ahead)
-        future_price = model.predict(last_data)[0]
-        predictions[minutes_ahead] = (future_price, future_time.strftime('%Y-%m-%d %I:%M %p %Z'))
+    gain = pred * 100
+    now_local = datetime.now(pytz.timezone(LOCAL_TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S %Z')
 
-    return predictions
+    recommendation = "HOLD"
+    if gain >= 10 and gain <= 15:
+        recommendation = "BUY (Scalp)"
+    elif gain <= -10 and gain >= -15:
+        recommendation = "SELL (Scalp)"
 
-# ========== Streamlit App ==========
+    return {
+        "prediction": round(last_row['close'].values[0] * (1 + pred), 2),
+        "gain_percent": round(gain, 2),
+        "recommendation": recommendation,
+        "timestamp": now_local
+    }
 
-st.set_page_config(page_title="Crypto Streamlit AI", layout="wide")
+# ----------------- Streamlit UI ----------------- #
+st.set_page_config(page_title="Crypto Predictor", layout="wide")
 
-st.title("🧠 Crypto Price AI + Scalp Signals")
-st.markdown("Made with ❤️ using Kraken + Streamlit")
+st.title("💸 Crypto Price Dashboard + AI Prediction")
+st.markdown(f"**Timezone:** {LOCAL_TIMEZONE}")
 
-# Coin Selection and Gain Toggle
-coin = st.selectbox("Choose a coin:", list(COINS.keys()))
-gain_thresh = st.slider("Scalp % Gain Threshold", 0.001, 0.05, 0.01, 0.001)
-refresh_prices = st.button("🔄 Refresh Prices")
-refresh_predictions = st.button("🔁 Refresh Predictions")
+selected_coin = st.selectbox("Choose a coin:", list(SUPPORTED_COINS.keys()))
+pair = SUPPORTED_COINS[selected_coin]
 
-# Data Fetch
-pair = COINS[coin]
-df = fetch_ohlc(pair)
+show_sma = st.checkbox("📊 Show SMA (20)", value=True)
+show_ema = st.checkbox("📈 Show EMA (20)", value=True)
 
-# Price Display
-if df is not None:
-    price = get_latest_price(df)
-    local_time = datetime.now(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d %I:%M %p %Z')
-    st.metric(label=f"📈 Current {coin} Price", value=f"${price:,.2f}")
-    st.caption(f"Last Updated: {local_time}")
+refresh = st.button("🔁 Refresh Data")
+predict_now = st.button("🎯 Refresh Prediction")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_data():
+    return get_ohlcv_data(pair)
+
+if refresh:
+    st.cache_data.clear()
+df = load_data()
+
+if df.empty:
+    st.error("Failed to load data.")
 else:
-    st.error("Failed to fetch OHLCV data.")
-    st.stop()
+    current_price = df['close'].iloc[-1]
+    st.subheader(f"💰 {selected_coin} Current Price: ${current_price:.2f}")
+    st.markdown(f"**Last update:** {datetime.now(pytz.timezone(LOCAL_TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-# Add Indicators and Signals
-df = calculate_indicators(df)
-df = generate_signals(df, gain_thresh)
+    df = calculate_indicators(df, show_sma, show_ema)
 
-# Chart
-st.subheader("📊 Price Chart with SMA/EMA + Buy/Sell")
-st.line_chart(df.set_index('time')[['close', 'SMA_20', 'EMA_20']])
+    st.line_chart(df)
 
-# Signal Table
-st.dataframe(df[['time', 'close', 'Signal']].tail(10), use_container_width=True)
-
-# Predictions
-if refresh_predictions or refresh_prices:
-    st.subheader("🔮 AI Price Predictions (Local Time)")
-    preds = predict_prices(df)
-    for k, (price, ts) in preds.items():
-        st.write(f"**{k} min** → ${price:.2f} at *{ts}*")
-
+    if predict_now:
+        pred_info = generate_predictions(df)
+        st.success(f"📈 **Predicted Price:** ${pred_info['prediction']}")
+        st.info(f"📊 Gain: {pred_info['gain_percent']}% — {pred_info['recommendation']}")
+        st.caption(f"🕒 Prediction Time: {pred_info['timestamp']}")
