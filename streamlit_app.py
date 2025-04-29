@@ -1,97 +1,115 @@
-
-import streamlit as st
+import krakenex
 import pandas as pd
-import numpy as np
-from datetime import datetime
-import ccxt
+import streamlit as st
 import plotly.graph_objects as go
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
-import streamlit.components.v1 as components
+from datetime import datetime
 
-st.set_page_config(
-    page_title="📱 Local Crypto Alerts",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
+class CryptoApp:
+    def __init__(self):
+        self.last_refresh = None
 
-def play_sound():
-    sound_url = "https://www.soundjay.com/buttons/sounds/beep-07.mp3"
-    st.markdown(f'''
-        <audio autoplay>
-            <source src="{sound_url}" type="audio/mpeg">
-        </audio>
-    ''', unsafe_allow_html=True)
+    # Fetch Kraken OHLCV data
+    def fetch_kraken_ohlcv(self, symbol="BTCUSD", interval=5):
+        # Initialize Kraken API client
+        k = krakenex.API()
 
-st.title("📡 Local Crypto Alert App")
-st.caption("Desktop-only app with predictions and live indicators")
+        try:
+            # Fetch OHLC data from Kraken API
+            ohlcv_data = k.query_public('OHLC', {
+                'pair': symbol,         # Currency pair (e.g., 'BTCUSD')
+                'interval': interval    # Timeframe interval (5, 15, 60, 1440, etc.)
+            })
+            
+            # Check if the response is successful
+            if ohlcv_data.get('error'):
+                st.error(f"Error fetching data from Kraken: {ohlcv_data['error']}")
+                return None
+            
+            # Extract and convert data into DataFrame
+            ohlcv = ohlcv_data['result'][symbol]
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'closed', 'count', 'average'])
+            
+            # Convert timestamp to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
 
-default_coins = ["BTC", "ETH", "SOL", "XRP", "DOGE", "MATIC"]
-custom_coin = st.text_input("➕ Add Custom Coin (e.g. ADA)", key="custom_coin_input")
-coin_list = default_coins + ([custom_coin.upper()] if custom_coin and custom_coin.upper() not in default_coins else [])
-symbol = st.selectbox("Select Coin", coin_list, index=0, key="mobile_coin")
-forecast_minutes = st.slider("Predict Minutes Ahead", 1, 30, 5, key="mobile_minutes")
-alert_threshold = st.slider("Trigger Alert If Move > $", 0.5, 10.0, 2.0, step=0.5, key="mobile_threshold")
+            return df
+        except Exception as e:
+            st.error(f"Error fetching data: {e}")
+            return None
 
-if st.button("🔄 Refresh Prediction"):
-    st.session_state["trigger_refresh"] = True
+    # Function to calculate technical indicators (Simple example: SMA)
+    def calculate_technical_indicators(self, df):
+        # Moving Average (SMA) as an example of technical indicator
+        df['SMA_50'] = df['close'].rolling(window=50).mean()
+        return df
 
-symbol_full = f"{symbol}/USDT"
-exchange = ccxt.kraken()
-
-try:
-    exchange.load_markets()
-    ohlcv = exchange.fetch_ohlcv(symbol_full, "5m", limit=100)
-    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df["returns"] = df["close"].pct_change()
-    df["sma"] = df["close"].rolling(10).mean()
-    df["ema"] = df["close"].ewm(span=10).mean()
-    df["rsi"] = df["returns"].rolling(14).mean() / (df["returns"].rolling(14).std() + 1e-8)
-    df["future"] = df["close"].shift(-forecast_minutes)
-    df.dropna(inplace=True)
-
-    features = ["open", "high", "low", "close", "volume", "returns", "sma", "ema", "rsi"]
-    X = df[features]
-    y = df["future"]
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    model = RandomForestRegressor(n_estimators=100)
-    model.fit(X_scaled[:-1], y[:-1])
-    pred = model.predict([X_scaled[-1]])[0]
-    last_price = df["close"].iloc[-1]
-    delta = pred - last_price
-    direction = "UP 📈" if delta > 0 else "DOWN 📉"
-    alert = abs(delta) >= alert_threshold
-
-    st.metric(label="Current Price", value=f"${last_price:.2f}")
-    st.metric(label="Predicted Price", value=f"${pred:.2f}")
-    st.metric(label="Expected Move", value=f"{direction} ${abs(delta):.2f}")
-    if alert:
-        st.success("🔔 ALERT TRIGGERED!")
-        play_sound()
-    else:
-        st.info("No alert triggered.")
-
-    with st.expander("📊 View Chart"):
+    # Function to create and display the historical chart
+    def create_price_history_chart(self, df, symbol):
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"], name="Close"))
-        fig.add_trace(go.Scatter(x=df["timestamp"], y=df["sma"], name="SMA", line=dict(dash="dot")))
-        fig.add_trace(go.Scatter(x=df["timestamp"], y=df["ema"], name="EMA", line=dict(dash="dot")))
-        st.plotly_chart(fig, use_container_width=True)
 
-except Exception as e:
-    st.error(f"Failed to load data for {symbol_full}: {e}")
+        # Adding the Close Price Line
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['close'], mode='lines', name=f'{symbol} Close', line=dict(color='blue')))
+        
+        # Adding the 50-period Moving Average (SMA)
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['SMA_50'], mode='lines', name='SMA 50', line=dict(color='orange')))
 
-# Gold price ticker and market news feed
-st.markdown("### 🟡 Gold Price Ticker (USD)")
-components.html("""
-    <iframe src="https://goldbroker.com/widget/live-price/gold/1?currency=USD" 
-            width="100%" height="60" frameborder="0" scrolling="no"></iframe>
-""", height=60)
+        # Layout customization
+        fig.update_layout(
+            title=f"{symbol} Price History with SMA50",
+            xaxis_title="Time",
+            yaxis_title="Price (USD)",
+            template="plotly_dark",
+            xaxis_rangeslider_visible=False
+        )
+        return fig
 
-st.markdown("### 🗞️ Market News Feed")
-components.html("""
-    <iframe src="https://rss.app/embed/v1/wall/your_widget_id" 
-            width="100%" height="600" frameborder="0" scrolling="no"></iframe>
-""", height=600)
+    # Function to display technical indicators
+    def display_technical_indicators(self, df):
+        st.write("## Technical Indicators")
+        st.write(df[['timestamp', 'close', 'SMA_50']].tail(10))
+
+    # Function to display predictions (dummy example)
+    def display_predictions(self):
+        st.write("## AI Predictions (Placeholder)")
+
+    # Function to run the app
+    def run(self):
+        selected_crypto = st.sidebar.selectbox('Select Cryptocurrency', ['BTCUSD', 'ETHUSD', 'SOLUSD', 'XRPUSD', 'ADAUSD'])
+        timeframe = st.sidebar.selectbox('Timeframe', ['5m', '15m', '1h', '1d', '1wk'])
+        refresh = st.sidebar.button('Refresh Data')
+
+        if refresh:
+            interval = 5  # Default interval of 5 minutes
+            if timeframe == '15m':
+                interval = 15
+            elif timeframe == '1h':
+                interval = 60
+            elif timeframe == '1d':
+                interval = 1440
+            elif timeframe == '1wk':
+                interval = 10080  # 7 days in minutes
+
+            # Fetch data
+            price_df = self.fetch_kraken_ohlcv(symbol=selected_crypto, interval=interval)
+            
+            if price_df is not None and not price_df.empty:
+                # Calculate technical indicators (e.g., SMA50)
+                price_df = self.calculate_technical_indicators(price_df)
+                
+                # Display the technical indicators
+                self.display_technical_indicators(price_df)
+
+                # Create and display the chart
+                fig = self.create_price_history_chart(price_df, selected_crypto)
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Placeholder for predictions (if you want to integrate AI predictions)
+                self.display_predictions()
+            else:
+                st.error("Failed to fetch OHLCV data.")
+                
+
+# Run the app
+if __name__ == "__main__":
+    app = CryptoApp()
+    app.run()
