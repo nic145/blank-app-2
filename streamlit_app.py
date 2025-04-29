@@ -1,115 +1,105 @@
-import krakenex
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import krakenex
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
+import requests
 
-class CryptoApp:
-    def __init__(self):
-        self.last_refresh = None
+# Initialize Kraken API client
+k = krakenex.API()
 
-    # Fetch Kraken OHLCV data
-    def fetch_kraken_ohlcv(self, symbol="BTCUSD", interval=5):
-        # Initialize Kraken API client
-        k = krakenex.API()
+# Supported Kraken crypto pairs
+CRYPTO_PAIRS = {
+    "BTC": "XXBTZUSD",
+    "ETH": "XETHZUSD",
+    "ETC": "XETCZUSD",
+    "SOL": "SOLUSD",
+    "XRP": "XXRPZUSD",
+    "ADA": "ADAUSD"
+}
 
-        try:
-            # Fetch OHLC data from Kraken API
-            ohlcv_data = k.query_public('OHLC', {
-                'pair': symbol,         # Currency pair (e.g., 'BTCUSD')
-                'interval': interval    # Timeframe interval (5, 15, 60, 1440, etc.)
-            })
-            
-            # Check if the response is successful
-            if ohlcv_data.get('error'):
-                st.error(f"Error fetching data from Kraken: {ohlcv_data['error']}")
-                return None
-            
-            # Extract and convert data into DataFrame
-            ohlcv = ohlcv_data['result'][symbol]
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'closed', 'count', 'average'])
-            
-            # Convert timestamp to datetime
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+st.set_page_config(page_title="Crypto AI Dashboard", layout="wide")
 
-            return df
-        except Exception as e:
-            st.error(f"Error fetching data: {e}")
-            return None
+st.title("💹 Crypto AI Dashboard (Powered by Kraken)")
 
-    # Function to calculate technical indicators (Simple example: SMA)
-    def calculate_technical_indicators(self, df):
-        # Moving Average (SMA) as an example of technical indicator
-        df['SMA_50'] = df['close'].rolling(window=50).mean()
-        return df
+# Sidebar
+st.sidebar.header("Select Options")
+selected_coin = st.sidebar.selectbox("Select a coin", list(CRYPTO_PAIRS.keys()))
+scalping_toggle = st.sidebar.toggle("💥 Enable Scalping Predictions")
 
-    # Function to create and display the historical chart
-    def create_price_history_chart(self, df, symbol):
-        fig = go.Figure()
+# Utility: Fetch historical OHLC data
+@st.cache_data(show_spinner=False)
+def fetch_ohlcv(pair, interval="60", since_hours=48):
+    since = int((datetime.utcnow() - timedelta(hours=since_hours)).timestamp())
+    res = k.query_public('OHLC', {'pair': pair, 'interval': interval, 'since': since})
+    data = res['result'][pair]
+    df = pd.DataFrame(data, columns=[
+        'timestamp', 'open', 'high', 'low', 'close',
+        'vwap', 'volume', 'count'
+    ])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+    df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
+    return df
 
-        # Adding the Close Price Line
-        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['close'], mode='lines', name=f'{symbol} Close', line=dict(color='blue')))
-        
-        # Adding the 50-period Moving Average (SMA)
-        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['SMA_50'], mode='lines', name='SMA 50', line=dict(color='orange')))
+# Add indicators
+def calculate_indicators(df):
+    df['SMA_20'] = df['close'].rolling(window=20).mean()
+    df['EMA_20'] = df['close'].ewm(span=20).mean()
+    return df
 
-        # Layout customization
-        fig.update_layout(
-            title=f"{symbol} Price History with SMA50",
-            xaxis_title="Time",
-            yaxis_title="Price (USD)",
-            template="plotly_dark",
-            xaxis_rangeslider_visible=False
-        )
-        return fig
+# Detect crossover signals
+def detect_crossovers(df):
+    signals = []
+    for i in range(1, len(df)):
+        prev = df.iloc[i - 1]
+        curr = df.iloc[i]
+        if prev['SMA_20'] < prev['EMA_20'] and curr['SMA_20'] > curr['EMA_20']:
+            signals.append((curr['timestamp'], curr['close'], "BUY"))
+        elif prev['SMA_20'] > prev['EMA_20'] and curr['SMA_20'] < curr['EMA_20']:
+            signals.append((curr['timestamp'], curr['close'], "SELL"))
+    return signals
 
-    # Function to display technical indicators
-    def display_technical_indicators(self, df):
-        st.write("## Technical Indicators")
-        st.write(df[['timestamp', 'close', 'SMA_50']].tail(10))
+# Chart plotting
+def plot_chart(df, signals):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df['timestamp'], open=df['open'], high=df['high'],
+        low=df['low'], close=df['close'], name="Candles"
+    ))
+    fig.add_trace(go.Scatter(
+        x=df['timestamp'], y=df['SMA_20'], name='SMA 20', line=dict(color='orange')
+    ))
+    fig.add_trace(go.Scatter(
+        x=df['timestamp'], y=df['EMA_20'], name='EMA 20', line=dict(color='blue')
+    ))
 
-    # Function to display predictions (dummy example)
-    def display_predictions(self):
-        st.write("## AI Predictions (Placeholder)")
+    for ts, price, signal in signals:
+        fig.add_trace(go.Scatter(
+            x=[ts], y=[price], mode='markers+text',
+            marker=dict(color='green' if signal == 'BUY' else 'red', size=10),
+            text=signal, name=signal
+        ))
 
-    # Function to run the app
-    def run(self):
-        selected_crypto = st.sidebar.selectbox('Select Cryptocurrency', ['BTCUSD', 'ETHUSD', 'SOLUSD', 'XRPUSD', 'ADAUSD'])
-        timeframe = st.sidebar.selectbox('Timeframe', ['5m', '15m', '1h', '1d', '1wk'])
-        refresh = st.sidebar.button('Refresh Data')
+    fig.update_layout(
+        title=f"{selected_coin} Price Chart with Indicators",
+        xaxis_title="Time", yaxis_title="Price (USD)", height=600
+    )
+    return fig
 
-        if refresh:
-            interval = 5  # Default interval of 5 minutes
-            if timeframe == '15m':
-                interval = 15
-            elif timeframe == '1h':
-                interval = 60
-            elif timeframe == '1d':
-                interval = 1440
-            elif timeframe == '1wk':
-                interval = 10080  # 7 days in minutes
+try:
+    pair = CRYPTO_PAIRS[selected_coin]
+    df = fetch_ohlcv(pair)
+    df = calculate_indicators(df)
+    signals = detect_crossovers(df) if scalping_toggle else []
 
-            # Fetch data
-            price_df = self.fetch_kraken_ohlcv(symbol=selected_crypto, interval=interval)
-            
-            if price_df is not None and not price_df.empty:
-                # Calculate technical indicators (e.g., SMA50)
-                price_df = self.calculate_technical_indicators(price_df)
-                
-                # Display the technical indicators
-                self.display_technical_indicators(price_df)
+    st.subheader(f"📈 {selected_coin} Historical Chart")
+    st.plotly_chart(plot_chart(df, signals), use_container_width=True)
 
-                # Create and display the chart
-                fig = self.create_price_history_chart(price_df, selected_crypto)
-                st.plotly_chart(fig, use_container_width=True)
+    if signals:
+        st.subheader("📍 Scalping Signals")
+        for ts, price, signal in signals[-5:]:
+            st.write(f"{signal} at {price:.2f} on {ts.strftime('%Y-%m-%d %H:%M:%S')}")
 
-                # Placeholder for predictions (if you want to integrate AI predictions)
-                self.display_predictions()
-            else:
-                st.error("Failed to fetch OHLCV data.")
-                
-
-# Run the app
-if __name__ == "__main__":
-    app = CryptoApp()
-    app.run()
+except Exception as e:
+    st.error("🚨 Failed to load chart.")
+    st.exception(e)
