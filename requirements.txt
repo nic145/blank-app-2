@@ -1,8 +1,7 @@
-streamlit==1.33.0
-pandas==2.2.2
-numpy==1.26.4
-requests==2.31.0
-matplotlib==3.8.4
-mplfinance==0.12.10b0
-scikit-learn==1.4.2
-pytz==2024.1
+streamlit
+pandas
+numpy
+scikit-learn
+tensorflow
+plotly
+requests

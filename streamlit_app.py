@@ -2,137 +2,154 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-from datetime import datetime, timedelta
+import time
+import datetime
+import plotly.graph_objects as go
 from sklearn.ensemble import RandomForestRegressor
-import pytz
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.optimizers import Adam
+from sklearn.preprocessing import MinMaxScaler
+import json
 
-# === CONFIG ===
-st.set_page_config(page_title="Crypto Dashboard", layout="wide")
+# Webhook URL
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1367114033421094983/ZrE7E_ule4aOQHR-rEc8zfnSAIxHLvDO88tzIhIegCulIBKtQDmIMYBc8rpps2B4gnYp"
 
-# === DISCORD WEBHOOK ===
-WEBHOOK_URL = "https://discord.com/api/webhooks/1367114033421094983/ZrE7E_ule4aOQHR-rEc8zfnSAIxHLvDO88tzIhIegCulIBKtQDmIMYBc8rpps2B4gnYp"
+st.set_page_config(page_title="Crypto AI Dashboard", layout="wide")
 
-def send_discord_alert(message):
-    payload = {"content": message}
-    try:
-        requests.post(WEBHOOK_URL, json=payload)
-    except Exception as e:
-        st.warning(f"Failed to send Discord alert: {e}")
+st.title("📈 Real-Time Crypto AI Dashboard")
+st.caption("Powered by Kraken + Hybrid AI (Random Forest + LSTM)")
 
-# === FUNCTIONS ===
-def get_ohlc(coin, interval='60'):
-    url = f"https://api.kraken.com/0/public/OHLC?pair={coin}&interval={interval}"
-    resp = requests.get(url).json()
-    key = list(resp['result'].keys())[0]
-    data = resp['result'][key]
-    df = pd.DataFrame(data, columns=[
-        'Time', 'Open', 'High', 'Low', 'Close', 'VWAP', 'Volume', 'Count'])
-    df['Time'] = pd.to_datetime(df['Time'], unit='s')
-    df.set_index('Time', inplace=True)
+# -------------------------------
+# FETCH DATA FROM KRAKEN API
+# -------------------------------
+
+@st.cache_data(ttl=60)
+def fetch_ohlcv(symbol: str, interval="60", limit=100):
+    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval={interval}"
+    response = requests.get(url)
+    data = response.json()
+
+    if "error" in data and data["error"]:
+        st.error(f"Kraken API Error: {data['error']}")
+        return pd.DataFrame()
+
+    if "result" not in data:
+        st.error("Invalid response from Kraken API.")
+        return pd.DataFrame()
+
+    key = list(data["result"].keys())[0]
+    ohlc = data["result"][key]
+
+    df = pd.DataFrame(ohlc, columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"])
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df.set_index("time", inplace=True)
     df = df.astype(float)
     return df
 
-def calculate_volatility(df):
-    df['Returns'] = df['Close'].pct_change()
-    df['Volatility (%)'] = df['Returns'].rolling(window=10).std() * 100
-    df['ATR'] = (df['High'] - df['Low']).rolling(window=14).mean()
-    df['Price Change %'] = df['Close'].pct_change(periods=3) * 100
-    return df
+# -------------------------------
+# AI HYBRID MODEL: RF + LSTM
+# -------------------------------
 
-def predict(df, future_minutes=60):
-    df = df[['Close']].copy()
-    df['Target'] = df['Close'].shift(-1)
-    df.dropna(inplace=True)
-    X = np.arange(len(df)).reshape(-1, 1)
-    y = df['Target'].values
-    model = RandomForestRegressor()
-    model.fit(X, y)
+def prepare_lstm_data(df, n_steps=10):
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(df[['close']])
+    X, y = [], []
+    for i in range(len(scaled) - n_steps):
+        X.append(scaled[i:i+n_steps])
+        y.append(scaled[i+n_steps][0])
+    return np.array(X), np.array(y), scaler
 
-    next_index = len(df)
-    future_index = np.array([[next_index + (future_minutes // 15)]])
-    pred = model.predict(future_index)[0]
-    pred_time = df.index[-1] + timedelta(minutes=future_minutes)
-    return round(pred, 2), pred_time
+def predict_price(df, minutes_forward=60):
+    df = df.copy().dropna()
 
-def determine_signal(current_price, predicted_price, threshold):
-    change_pct = (predicted_price - current_price) / current_price * 100
-    if change_pct >= threshold:
-        return "BUY", "🟢"
-    elif change_pct <= -threshold:
-        return "SELL", "🔴"
-    else:
-        return "HOLD", "⚪"
+    # Random Forest Model
+    df['returns'] = df['close'].pct_change().fillna(0)
+    df['volatility'] = df['returns'].rolling(5).std().fillna(0)
+    features = df[['open', 'high', 'low', 'close', 'volume', 'returns', 'volatility']]
+    X_rf = features.iloc[:-minutes_forward]
+    y_rf = df['close'].shift(-minutes_forward).dropna()
+    X_rf = X_rf.loc[y_rf.index]
+    rf_model = RandomForestRegressor()
+    rf_model.fit(X_rf, y_rf)
+    rf_pred = rf_model.predict([features.iloc[-1]])[0]
 
-# === UI ===
-st.title("💹 Real-Time Crypto Dashboard")
+    # LSTM Model
+    X_lstm, y_lstm, scaler = prepare_lstm_data(df)
+    model = Sequential([
+        LSTM(50, return_sequences=False, input_shape=(X_lstm.shape[1], X_lstm.shape[2])),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(), loss='mse')
+    model.fit(X_lstm, y_lstm, epochs=10, verbose=0)
+    last_sequence = scaler.transform(df[['close']])[-10:]
+    lstm_pred = model.predict(last_sequence.reshape(1, 10, 1), verbose=0)[0][0]
+    lstm_pred = scaler.inverse_transform([[lstm_pred]])[0][0]
 
-# Coin Selection
-main_coins = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT', 'ADAUSDT', 'DOGEUSDT']
-coin = st.selectbox("Choose Coin Pair", main_coins)
-custom_coin = st.text_input("Or enter a custom Kraken pair (e.g., LTCUSDT)")
-pair = custom_coin.upper() if custom_coin else coin
+    # Final hybrid prediction
+    predicted = (rf_pred + lstm_pred) / 2
+    return round(predicted, 2), datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# Sliders
-threshold = st.slider("Scalp % Gain Threshold", 0.1, 50.0, 10.0)
-future_minutes = st.slider("Prediction Horizon (minutes)", 15, 480, 60, step=15)
+# -------------------------------
+# DISCORD ALERT
+# -------------------------------
 
-# Timezone Selection
-user_tz = st.selectbox("Select Your Timezone", pytz.all_timezones, index=pytz.all_timezones.index("UTC"))
-local_tz = pytz.timezone(user_tz)
+def send_discord_alert(message: str):
+    data = {"content": message}
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        if response.status_code != 204:
+            st.warning("Discord webhook error.")
+    except Exception as e:
+        st.error(f"Webhook error: {e}")
 
-# === DATA FETCHING ===
-try:
-    df = get_ohlc(pair, interval='60')
-    df = calculate_volatility(df)
-    current_price = df['Close'].iloc[-1]
+# -------------------------------
+# UI COMPONENTS
+# -------------------------------
 
-    # === PREDICTION ===
-    predicted_price, predicted_time = predict(df.copy(), future_minutes)
-    predicted_time = predicted_time.replace(tzinfo=pytz.utc).astimezone(local_tz)
-    timestamp = predicted_time.strftime("%I:%M %p %Z")
+symbol = st.selectbox("Select a Kraken trading pair", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"])
+time_forward = st.slider("⏩ Predict how far into the future (minutes)", 15, 480, 60, step=15)
 
-    # === SIGNAL ===
-    signal, icon = determine_signal(current_price, predicted_price, threshold)
+df = fetch_ohlcv(symbol, interval="60")
 
-    # Send Discord Alert
-    if signal in ["BUY", "SELL"]:
-        send_discord_alert(f"{icon} {pair} {signal} signal triggered! Predicted price: ${predicted_price} at {timestamp}")
+if df.empty:
+    st.stop()
 
-    # === CHART ===
-    st.subheader(f"Candlestick Chart - {pair} (1h)")
-    st.write(f"**Current Price:** ${current_price:.2f}   \n**Predicted Price:** ${predicted_price} at {timestamp}   \n**Signal:** {signal} {icon}")
+current_price = df["close"].iloc[-1]
+predicted_price, predicted_time = predict_price(df, minutes_forward=time_forward)
 
-    mpf_df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    ap = []
-    if signal != "HOLD":
-        arrow_color = 'green' if signal == 'BUY' else 'red'
-        arrow = mpf.make_addplot([np.nan]*(len(mpf_df)-1)+[predicted_price], type='scatter', markersize=100, marker='^' if signal == 'BUY' else 'v', color=arrow_color)
-        ap.append(arrow)
+# Determine signal
+if predicted_price > current_price * 1.01:
+    signal = "BUY"
+    dot_color = "green"
+elif predicted_price < current_price * 0.99:
+    signal = "SELL"
+    dot_color = "red"
+else:
+    signal = "HOLD"
+    dot_color = "yellow"
 
-    fig, _ = mpf.plot(
-        mpf_df,
-        type='candle',
-        volume=True,
-        style='yahoo',  # light mode
-        addplot=ap,
-        returnfig=True,
-        figsize=(12, 6)
-    )
-    st.pyplot(fig)
+# Send Discord alert (once per run or on button press)
+if st.button("🔔 Send Discord Alert"):
+    send_discord_alert(f"Signal for {symbol}: **{signal}**\nCurrent: ${current_price:.2f}\nPredicted: ${predicted_price:.2f}")
 
-    # === VOLATILITY CHART ===
-    st.subheader("Volatility Indicators")
-    st.line_chart(df[['Volatility (%)', 'ATR', 'Price Change %']].dropna())
+# Display prices and signal
+st.markdown(f"""
+### 💰 Current Price: `${current_price:.2f}`  
+### 🤖 Predicted Price: `{predicted_price:.2f}` ({predicted_time})  
+### 🔍 Signal: **:{dot_color}_circle: {signal}**
+""")
 
-    # === AUTO REFRESH WORKAROUND ===
-    if 'last_refresh' not in st.session_state:
-        st.session_state.last_refresh = datetime.now()
+# -------------------------------
+# TRADINGVIEW CHART EMBED
+# -------------------------------
 
-    if (datetime.now() - st.session_state.last_refresh).seconds > 60:
-        st.session_state.last_refresh = datetime.now()
-        st.experimental_rerun()
+tradingview_widget = f"""
+<iframe src="https://www.tradingview.com/widgetembed/?frameElementId=tradingview_{symbol}&symbol=KRAKEN:{symbol}&interval=60&theme=dark&style=1&locale=en&utm_source=streamlit" 
+width="100%" height="600" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
+"""
 
-except Exception as e:
-    st.error(f"Something went wrong: {e}")
+st.markdown("### 📊 Live Kraken Candlestick Chart")
+st.components.v1.html(tradingview_widget, height=600)
+
+st.caption("Made with ❤️ using Kraken, TradingView, and AI")
