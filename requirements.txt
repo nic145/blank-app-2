@@ -1,7 +1,7 @@
-streamlit
-pandas
-numpy
-requests
-scikit-learn
-matplotlib
-mplfinance
+streamlit==1.33.0
+pandas==2.2.2
+numpy==1.26.4
+requests==2.31.0
+scikit-learn==1.4.2
+mplfinance==0.12.10b0
+pytz==2024.1
