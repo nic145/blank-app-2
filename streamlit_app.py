@@ -1,132 +1,151 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-import datetime
 import time
 import os
-import joblib
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
-from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
+import datetime as dt
+from ta import add_all_ta_features
+from ta.utils import dropna
+from keras.models import Sequential
+from keras.layers import Dense, LSTM
+from sklearn.preprocessing import MinMaxScaler
+import requests
+import json
 
-# === Configuration ===
-DATA_DIR = "data"
-MODEL_DIR = "models"
+# === CONFIG ===
+st.set_page_config(page_title="Crypto AI Dashboard", layout="wide")
+
+# === LOCAL STORAGE ===
+DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
 
-TOP_COINS = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "LTC/USDT", "BCH/USDT", "ADA/USDT", "DOT/USDT"]
+# === STATE INIT ===
+if 'custom_coin' not in st.session_state:
+    st.session_state['custom_coin'] = ''
+if 'selected_coin' not in st.session_state:
+    st.session_state['selected_coin'] = 'BTC/USDT'
+if 'show_notifications' not in st.session_state:
+    st.session_state['show_notifications'] = True
+if 'prediction_timeframe' not in st.session_state:
+    st.session_state['prediction_timeframe'] = 15
 
-# === Streamlit Setup ===
-st.set_page_config(page_title="AI Crypto Dashboard", layout="wide")
-st.title("🤖 AI Crypto Dashboard")
+# === HEADER ===
+st.title("📈 Crypto AI Dashboard")
+st.markdown(f"**Time (Local):** {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# === Sidebar Settings ===
-st.sidebar.title("⚙️ Settings")
-selected_coin = st.sidebar.selectbox("Top Coins", TOP_COINS)
-custom_coin = st.sidebar.text_input("Or Custom Coin (e.g., SOL/USDT)").upper()
-if custom_coin:
-    selected_coin = custom_coin
+# === SIDEBAR: Signal & Settings ===
+with st.sidebar:
+    st.header("🔔 AI Prediction Signals")
+    st.session_state['show_notifications'] = st.checkbox("Enable Notifications", True)
+    leverage = st.slider("Leverage", 1, 50, 25)
+    capital = st.number_input("Capital ($)", value=200)
+    gain_threshold = st.slider("Scalp Gain %", 0.5, 50.0, 10.0)
 
-prediction_timeframe = st.sidebar.selectbox("Prediction Timeframe", ["15m", "30m", "1h", "4h"])
-leverage = st.sidebar.slider("Leverage", 1, 50, 25)
-position_size = st.sidebar.number_input("Position Size ($)", min_value=50, value=200, step=50)
+    st.markdown("---")
+    st.header("⚙️ Settings")
+    main_coins = ["BTC/USDT", "ETH/USDT", "ADA/USDT", "XRP/USDT", "SOL/USDT", "AVAX/USDT", "DOGE/USDT"]
+    selected = st.selectbox("Choose a coin", main_coins)
+    custom = st.text_input("Or add custom (e.g. TRX/USDT)")
+    if custom:
+        st.session_state['selected_coin'] = custom
+    else:
+        st.session_state['selected_coin'] = selected
 
-st.sidebar.markdown("### 🔔 Notification Toggles")
-notify_buy = st.sidebar.checkbox("BUY Alerts", True)
-notify_sell = st.sidebar.checkbox("SELL Alerts", True)
-notify_hold = st.sidebar.checkbox("HOLD Alerts", False)
+    st.session_state['prediction_timeframe'] = st.radio(
+        "Prediction Timeframe",
+        [15, 30, 60, 240], format_func=lambda x: f"{x} min"
+    )
 
-# === Helper Functions ===
-def fetch_ohlc(coin_pair):
-    symbol = coin_pair.replace("/", "")
-    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=1"
+# === FETCHING DATA ===
+@st.cache_data
+def fetch_ohlc_data(symbol, interval='15'):
+    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol.replace('/', '')}&interval={interval}"
     try:
-        res = requests.get(url).json()
-        key = next(k for k in res['result'].keys() if k != 'last')
-        ohlc = pd.DataFrame(res['result'][key], columns=["Time", "Open", "High", "Low", "Close", "Vwap", "Volume", "Count"])
-        ohlc["Time"] = pd.to_datetime(ohlc["Time"], unit="s")
-        ohlc.set_index("Time", inplace=True)
-        ohlc = ohlc.astype(float)
-        return ohlc
+        response = requests.get(url)
+        raw = response.json()
+        pair_key = list(raw['result'].keys())[0]
+        df = pd.DataFrame(raw['result'][pair_key], columns=[
+            'time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'
+        ])
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        df = df.set_index('time')
+        df = df.astype(float)
+        return df
     except Exception as e:
         st.error(f"Error fetching data: {e}")
         return pd.DataFrame()
 
-def train_lstm_model(data):
-    df = data.copy()
-    df["Target"] = df["Close"].shift(-1)
-    df.dropna(inplace=True)
-    X = df[["Close", "High", "Low", "Open", "Volume"]].values
-    y = df["Target"].values
-    generator = TimeseriesGenerator(X, y, length=10, batch_size=1)
-
+# === PREDICTION MODEL ===
+def create_model():
     model = Sequential()
-    model.add(LSTM(64, activation="relu", input_shape=(10, 5)))
+    model.add(LSTM(50, return_sequences=True, input_shape=(10, 1)))
+    model.add(LSTM(50))
     model.add(Dense(1))
-    model.compile(optimizer="adam", loss="mse")
-    model.fit(generator, epochs=5, verbose=0)
+    model.compile(optimizer='adam', loss='mse')
     return model
 
-def calculate_gain_loss(entry_price, predicted_price, capital, leverage):
-    price_change = (predicted_price - entry_price) / entry_price
-    return round(capital * leverage * price_change, 2)
+def train_and_predict(df, steps_ahead=1):
+    data = df[['close']].copy()
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(data)
 
-def send_discord_alert(signal_type, coin, price, gain):
-    if signal_type == "BUY" and not notify_buy: return
-    if signal_type == "SELL" and not notify_sell: return
-    if signal_type == "HOLD" and not notify_hold: return
-    st.write(f"📤 [Discord] {signal_type} alert for {coin} at ${price:.2f} | Est. P/L: ${gain:.2f}")
-    # To send: requests.post(WEBHOOK_URL, json={"content": message})
+    X, y = [], []
+    for i in range(10, len(scaled) - steps_ahead):
+        X.append(scaled[i-10:i, 0])
+        y.append(scaled[i + steps_ahead, 0])
+    X, y = np.array(X), np.array(y)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
 
-# === Load Data ===
-df = fetch_ohlc(selected_coin)
-if df.empty:
-    st.stop()
+    model = create_model()
+    model.fit(X, y, epochs=5, batch_size=16, verbose=0)
 
-symbol = selected_coin.replace("/", "")
-current_price = df["Close"].iloc[-1]
-model_path = os.path.join(MODEL_DIR, f"{symbol}_lstm.pkl")
+    last_sequence = scaled[-10:].reshape((1, 10, 1))
+    prediction_scaled = model.predict(last_sequence)
+    predicted_price = scaler.inverse_transform(prediction_scaled)[0][0]
+    return float(predicted_price)
 
-# === Load or Train Model ===
-if os.path.exists(model_path):
-    model = joblib.load(model_path)
+# === MAIN PANEL ===
+coin = st.session_state['selected_coin']
+interval = '15'
+df = fetch_ohlc_data(coin.replace('/', ''), interval)
+
+if not df.empty:
+    current_price = df['close'].iloc[-1]
+    predicted_price = train_and_predict(df, steps_ahead=int(st.session_state['prediction_timeframe'] // 15))
+
+    price_diff = predicted_price - current_price
+    signal = 'Buy' if price_diff > 0 else 'Sell' if price_diff < 0 else 'Hold'
+
+    # === SIMULATED SCALP GAIN ===
+    is_long = signal.lower() == 'buy'
+    price_movement = predicted_price - current_price
+    pct_change = (price_movement / current_price) * leverage * (1 if is_long else -1)
+    dollar_gain = (capital * pct_change / 100)
+
+    # === PRICE DISPLAY ===
+    st.subheader(f"🔍 {coin}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Current Price", f"${current_price:,.2f}")
+    col2.metric("Predicted", f"${predicted_price:,.2f}", delta=f"{price_diff:+.2f}")
+    col3.metric("Signal", signal)
+
+    st.markdown("---")
+
+    st.markdown("### 💸 Simulated Trade Outcome")
+    st.write(f"Leverage: {leverage}x | Capital: ${capital}")
+    st.success(f"Estimated {'Gain' if dollar_gain >= 0 else 'Loss'}: ${dollar_gain:,.2f} ({pct_change:.2f}%)")
+
+    # === CHART ===
+    st.markdown("### 📊 TradingView Chart")
+    symbol_code = coin.replace('/', '')
+    st.components.v1.html(f"""
+        <iframe src="https://www.tradingview.com/widgetembed/?frameElementId=tradingview_{symbol_code}&symbol=KRAKEN:{symbol_code}&interval=15&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=[]&theme=dark&style=1&timezone=Etc%2FUTC&withdateranges=1&hide_side_toolbar=0&allow_symbol_change=1&details=1&hotlist=1&calendar=1&news=1&locale=en"
+        width="100%" height="550" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
+    """, height=550)
+
+    # === BACKTEST PLACEHOLDER ===
+    st.markdown("### 🧪 Backtest Results (coming soon)")
+    st.info("Backtest UI and local CSV-based learning are under development.")
+
 else:
-    model = train_lstm_model(df)
-    joblib.dump(model, model_path)
-
-# === Make Prediction ===
-last_input = df[["Close", "High", "Low", "Open", "Volume"]].values[-10:]
-last_input = last_input.reshape((1, 10, 5))
-predicted_price = float(model.predict(last_input)[0][0])
-price_diff = predicted_price - current_price
-
-# === Generate Signal ===
-signal = "HOLD"
-if price_diff > current_price * 0.0015:
-    signal = "BUY"
-elif price_diff < -current_price * 0.0015:
-    signal = "SELL"
-
-est_gain = calculate_gain_loss(current_price, predicted_price, position_size, leverage)
-
-# === Display Metrics ===
-st.markdown(f"**🕒 Local Time:** `{datetime.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}`")
-st.metric("Current Price", f"${current_price:,.2f}")
-st.metric("Predicted Price", f"${predicted_price:,.2f}")
-st.metric("Signal", signal)
-st.metric("Est. P/L", f"${est_gain:,.2f}")
-
-# === Trigger Discord Alert ===
-send_discord_alert(signal, selected_coin, current_price, est_gain)
-
-# === TradingView Embed ===
-st.components.v1.html(f"""
-<iframe src="https://s.tradingview.com/widgetembed/?symbol=KRAKEN:{symbol}&interval=60&hidesidetoolbar=1&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=[]&theme=dark&style=1&timezone=Etc/UTC&withdateranges=1&hidevolume=0&allow_symbol_change=true&details=true&hotlist=true&calendar=true&news=stock&autosize=true"
-width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
-""", height=500)
-
-# === Future Feature Placeholder ===
-st.subheader("🔄 Backtesting (Coming Soon)")
-st.info("You'll be able to upload a CSV and evaluate historical strategy performance.")
+    st.error("Unable to fetch OHLC data. Please check symbol format or try again later.")
