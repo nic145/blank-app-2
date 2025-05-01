@@ -2,234 +2,131 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import datetime as dt
-import os
-import json
+import datetime
 import time
-
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
+import os
+import joblib
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM
 from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
-from ta.volatility import BollingerBands
-from ta.trend import MACD
-from ta.momentum import RSIIndicator
 
-# App settings
-st.set_page_config(page_title="Crypto AI Dashboard", layout="wide")
-st.title("📈 Real-Time Crypto AI Dashboard")
-st.markdown("**Made with love & AI · Live Kraken Data**")
-
-# Storage
-DATA_DIR = "data/crypto_ai_data"
+# === Configuration ===
+DATA_DIR = "data"
+MODEL_DIR = "models"
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Top 7 + custom coin input
-top_coins = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "ADA/USDT", "SOL/USDT", "DOGE/USDT", "DOT/USDT"]
-selected_coin = st.selectbox("Select Coin", top_coins)
-custom_coin = st.text_input("Or Enter Custom Kraken Pair (e.g. LTC/USDT)", "")
-symbol = custom_coin if custom_coin else selected_coin
+TOP_COINS = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "LTC/USDT", "BCH/USDT", "ADA/USDT", "DOT/USDT"]
 
-# Prediction timeframe
-prediction_timedelta = st.select_slider("Predict Ahead", options=["15m", "30m", "1h", "4h"], value="1h")
+# === Streamlit Setup ===
+st.set_page_config(page_title="AI Crypto Dashboard", layout="wide")
+st.title("🤖 AI Crypto Dashboard")
 
-# Notification toggles
-with st.sidebar.expander("🔔 Discord Notification Settings"):
-    notify_buy = st.checkbox("Notify on BUY", value=True)
-    notify_sell = st.checkbox("Notify on SELL", value=True)
-    notify_hold = st.checkbox("Notify on HOLD", value=False)
+# === Sidebar Settings ===
+st.sidebar.title("⚙️ Settings")
+selected_coin = st.sidebar.selectbox("Top Coins", TOP_COINS)
+custom_coin = st.sidebar.text_input("Or Custom Coin (e.g., SOL/USDT)").upper()
+if custom_coin:
+    selected_coin = custom_coin
 
-# Gain thresholds
-min_gain = st.slider("Scalp Min Gain (%)", 1, 50, 10)
-max_gain = st.slider("Scalp Max Gain (%)", 1, 50, 15)
+prediction_timeframe = st.sidebar.selectbox("Prediction Timeframe", ["15m", "30m", "1h", "4h"])
+leverage = st.sidebar.slider("Leverage", 1, 50, 25)
+position_size = st.sidebar.number_input("Position Size ($)", min_value=50, value=200, step=50)
 
-# TradingView chart embed
-def render_tradingview_chart(symbol):
-    base = symbol.replace("/", "").upper()
-    st.components.v1.html(f"""
-        <iframe src="https://s.tradingview.com/widgetembed/?frameElementId=tradingview_{base}&symbol=KRAKEN:{base}&interval=60&theme=dark&style=1&timezone=Etc%2FUTC&withdateranges=1"
-        width="100%" height="500" frameborder="0"></iframe>
-    """, height=500)
+st.sidebar.markdown("### 🔔 Notification Toggles")
+notify_buy = st.sidebar.checkbox("BUY Alerts", True)
+notify_sell = st.sidebar.checkbox("SELL Alerts", True)
+notify_hold = st.sidebar.checkbox("HOLD Alerts", False)
 
-render_tradingview_chart(symbol)
-
-# Kraken OHLC fetcher
-def get_ohlc(pair, interval=1, since=None):
-    url = f"https://api.kraken.com/0/public/OHLC?pair={pair.replace('/', '')}&interval={interval}"
-    if since:
-        url += f"&since={since}"
+# === Helper Functions ===
+def fetch_ohlc(coin_pair):
+    symbol = coin_pair.replace("/", "")
+    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=1"
     try:
-        response = requests.get(url).json()
-        data = list(response["result"].values())[0]
-        df = pd.DataFrame(data, columns=[
-            "time", "open", "high", "low", "close", "vwap", "volume", "count"
-        ])
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df.set_index("time", inplace=True)
-        df = df.astype(float)
-        return df
+        res = requests.get(url).json()
+        key = next(k for k in res['result'].keys() if k != 'last')
+        ohlc = pd.DataFrame(res['result'][key], columns=["Time", "Open", "High", "Low", "Close", "Vwap", "Volume", "Count"])
+        ohlc["Time"] = pd.to_datetime(ohlc["Time"], unit="s")
+        ohlc.set_index("Time", inplace=True)
+        ohlc = ohlc.astype(float)
+        return ohlc
     except Exception as e:
         st.error(f"Error fetching data: {e}")
         return pd.DataFrame()
 
-# Load and cache data
-@st.cache_data(ttl=60)
-def load_data(symbol, interval):
-    df = get_ohlc(symbol, interval)
-    if not df.empty:
-        df["returns"] = df["close"].pct_change()
-        df["volatility"] = df["returns"].rolling(window=10).std()
-        bb = BollingerBands(close=df["close"])
-        df["bb_upper"] = bb.bollinger_hband()
-        df["bb_lower"] = bb.bollinger_lband()
-        macd = MACD(close=df["close"])
-        df["macd"] = macd.macd()
-        df["macd_signal"] = macd.macd_signal()
-        rsi = RSIIndicator(close=df["close"])
-        df["rsi"] = rsi.rsi()
-        return df.dropna()
-    return pd.DataFrame()
+def train_lstm_model(data):
+    df = data.copy()
+    df["Target"] = df["Close"].shift(-1)
+    df.dropna(inplace=True)
+    X = df[["Close", "High", "Low", "Open", "Volume"]].values
+    y = df["Target"].values
+    generator = TimeseriesGenerator(X, y, length=10, batch_size=1)
 
-data = load_data(symbol, 1)
+    model = Sequential()
+    model.add(LSTM(64, activation="relu", input_shape=(10, 5)))
+    model.add(Dense(1))
+    model.compile(optimizer="adam", loss="mse")
+    model.fit(generator, epochs=5, verbose=0)
+    return model
 
-# Save locally
-csv_path = os.path.join(DATA_DIR, f"{symbol.replace('/', '_')}.csv")
-if not data.empty:
-    data.to_csv(csv_path)
+def calculate_gain_loss(entry_price, predicted_price, capital, leverage):
+    price_change = (predicted_price - entry_price) / entry_price
+    return round(capital * leverage * price_change, 2)
 
-# Features and target
-def create_features(df):
-    df = df.copy()
-    df["target"] = df["close"].shift(-1)
-    return df.dropna()
+def send_discord_alert(signal_type, coin, price, gain):
+    if signal_type == "BUY" and not notify_buy: return
+    if signal_type == "SELL" and not notify_sell: return
+    if signal_type == "HOLD" and not notify_hold: return
+    st.write(f"📤 [Discord] {signal_type} alert for {coin} at ${price:.2f} | Est. P/L: ${gain:.2f}")
+    # To send: requests.post(WEBHOOK_URL, json={"content": message})
 
-df_feat = create_features(data)
+# === Load Data ===
+df = fetch_ohlc(selected_coin)
+if df.empty:
+    st.stop()
 
-# Prepare for ML
-features = ["close", "rsi", "macd", "macd_signal", "bb_upper", "bb_lower", "volatility"]
-X = df_feat[features].values
-y = df_feat["target"].values
+symbol = selected_coin.replace("/", "")
+current_price = df["Close"].iloc[-1]
+model_path = os.path.join(MODEL_DIR, f"{symbol}_lstm.pkl")
 
-# Scale
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-
-# Split & generate sequences
-generator = TimeseriesGenerator(X_scaled, y, length=10, batch_size=1)
-
-# Train model
-model = Sequential()
-model.add(LSTM(64, input_shape=(10, X_scaled.shape[1]), return_sequences=False))
-model.add(Dense(1))
-model.compile(loss="mse", optimizer="adam")
-model.fit(generator, epochs=3, verbose=0)
-
-# Predict future price
-latest_seq = X_scaled[-10:].reshape(1, 10, X_scaled.shape[1])
-predicted_price = model.predict(latest_seq)[0][0]
-current_price = df_feat["close"].iloc[-1]
-prediction_time = df_feat.index[-1] + pd.Timedelta(minutes=prediction_time_map[predict_minutes])
-
-# Signal logic
-if predicted_price > current_price * (1 + scalp_pct / 100):
-    signal = "BUY"
-elif predicted_price < current_price * (1 - scalp_pct / 100):
-    signal = "SELL"
+# === Load or Train Model ===
+if os.path.exists(model_path):
+    model = joblib.load(model_path)
 else:
-    signal = "HOLD"
+    model = train_lstm_model(df)
+    joblib.dump(model, model_path)
 
-# Price target estimation
-scalp_entry_price = current_price
-scalp_exit_price = predicted_price if signal != "HOLD" else np.nan
+# === Make Prediction ===
+last_input = df[["Close", "High", "Low", "Open", "Volume"]].values[-10:]
+last_input = last_input.reshape((1, 10, 5))
+predicted_price = float(model.predict(last_input)[0][0])
+price_diff = predicted_price - current_price
 
-# Notification toggle logic
-alerts_enabled = notify_buy if signal == "BUY" else notify_sell if signal == "SELL" else notify_hold
+# === Generate Signal ===
+signal = "HOLD"
+if price_diff > current_price * 0.0015:
+    signal = "BUY"
+elif price_diff < -current_price * 0.0015:
+    signal = "SELL"
 
-# Discord webhook notification
-def send_discord_alert(signal, coin, current_price, predicted_price):
-    if not alerts_enabled:
-        return
-    msg = {
-        "content": f"**{signal} ALERT for {coin}**\nCurrent: ${current_price:.2f}\nPredicted: ${predicted_price:.2f}\nTarget: {prediction_time.strftime('%Y-%m-%d %H:%M:%S')}"
-    }
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json=msg)
-    except Exception as e:
-        st.warning(f"Discord alert failed: {e}")
+est_gain = calculate_gain_loss(current_price, predicted_price, position_size, leverage)
 
-send_discord_alert(signal, symbol, current_price, predicted_price)
+# === Display Metrics ===
+st.markdown(f"**🕒 Local Time:** `{datetime.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}`")
+st.metric("Current Price", f"${current_price:,.2f}")
+st.metric("Predicted Price", f"${predicted_price:,.2f}")
+st.metric("Signal", signal)
+st.metric("Est. P/L", f"${est_gain:,.2f}")
 
-# UI Layout
-st.markdown(f"### {symbol} Price Dashboard ({time.tzname[0]})")
-col1, col2 = st.columns(2)
-col1.metric("Current Price", f"${current_price:.2f}")
-col2.metric("AI Predicted Price", f"${predicted_price:.2f}", delta=f"{signal}")
+# === Trigger Discord Alert ===
+send_discord_alert(signal, selected_coin, current_price, est_gain)
 
-# TradingView Chart
-st.markdown("### Candlestick Chart")
-tradingview_symbol = f"KRAKEN:{symbol.replace('/', '')}"
-tradingview_html = f"""
-<iframe src="https://s.tradingview.com/widgetembed/?frameElementId=tradingview_{symbol}&symbol={tradingview_symbol}&interval={interval}&theme=dark&style=1&locale=en" width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
-"""
-st.components.v1.html(tradingview_html, height=500)
+# === TradingView Embed ===
+st.components.v1.html(f"""
+<iframe src="https://s.tradingview.com/widgetembed/?symbol=KRAKEN:{symbol}&interval=60&hidesidetoolbar=1&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=[]&theme=dark&style=1&timezone=Etc/UTC&withdateranges=1&hidevolume=0&allow_symbol_change=true&details=true&hotlist=true&calendar=true&news=stock&autosize=true"
+width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
+""", height=500)
 
-# Show predictions table
-st.markdown("### Recent Predictions")
-st.dataframe(pd.DataFrame({
-    "Timestamp": [prediction_time],
-    "Signal": [signal],
-    "Current Price": [current_price],
-    "Predicted Price": [predicted_price],
-    "Target Price": [scalp_exit_price],
-}).set_index("Timestamp"))
-
-# Local model save
-with open(MODEL_FILE, "wb") as f:
-    pickle.dump(model, f)
-with open(SCALER_FILE, "wb") as f:
-    pickle.dump(scaler, f)
-
-# Backtesting UI (placeholder)
-st.markdown("### Backtesting")
-uploaded = st.file_uploader("Upload historical CSV to backtest", type=["csv"])
-if uploaded:
-    try:
-        df_backtest = pd.read_csv(uploaded, parse_dates=["time"])
-        st.success("Backtest data loaded.")
-        st.dataframe(df_backtest.tail())
-    except Exception as e:
-        st.error(f"Failed to read backtest data: {e}")
-
-# --- AI Retrain Button ---
-st.markdown("### Model Training")
-if st.button("Retrain AI Model"):
-    with st.spinner("Retraining..."):
-        try:
-            model.fit(X, y, epochs=10, verbose=0)
-            with open(MODEL_FILE, "wb") as f:
-                pickle.dump(model, f)
-            st.success("Model retrained and saved locally.")
-        except Exception as e:
-            st.error(f"Error during retraining: {e}")
-
-# --- Auto-Refresh every 60 seconds ---
-def should_refresh():
-    if "last_refresh" not in st.session_state:
-        st.session_state.last_refresh = time.time()
-        return False
-    elapsed = time.time() - st.session_state.last_refresh
-    if elapsed > 60:
-        st.session_state.last_refresh = time.time()
-        return True
-    return False
-
-if should_refresh():
-    st.experimental_rerun()
-
-# --- Optional Footer / Debug Info ---
-st.markdown("---")
-st.markdown(
-    "📈 Made with ❤️ using Kraken API, TradingView charts, and AI predictions. "
-    "All times shown in your local timezone."
-)
+# === Future Feature Placeholder ===
+st.subheader("🔄 Backtesting (Coming Soon)")
+st.info("You'll be able to upload a CSV and evaluate historical strategy performance.")
