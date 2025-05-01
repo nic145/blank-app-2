@@ -2,158 +2,234 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import datetime
-import pytz
+import datetime as dt
+import os
 import json
+import time
+
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import Dense, LSTM
 from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
-from sklearn.preprocessing import MinMaxScaler
+from ta.volatility import BollingerBands
+from ta.trend import MACD
+from ta.momentum import RSIIndicator
 
-# Constants
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1367114033421094983/ZrE7E_ule4aOQHR-rEc8zfnSAIxHLvDO88tzIhIegCulIBKtQDmIMYBc8rpps2B4gnYp"
-TOP_COINS = ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'LTC', 'DOT']
-TIMEZONE = 'US/Eastern'
-PREDICTION_HORIZON = 8
-
-st.set_page_config(layout="wide", page_title="Crypto AI Dashboard")
-
-# Sidebar
-st.sidebar.title("⚙️ Prediction Controls")
-selected_coin = st.sidebar.selectbox("Choose a Coin", TOP_COINS)
-prediction_hours = st.sidebar.slider("Prediction Time Horizon (hours)", 1, PREDICTION_HORIZON, 1)
-scalp_gain = st.sidebar.slider("Scalp Gain Target (%)", 1, 50, 10)
-scalp_loss = st.sidebar.slider("Scalp Loss Limit (%)", 1, 50, 10)
-
+# App settings
+st.set_page_config(page_title="Crypto AI Dashboard", layout="wide")
 st.title("📈 Real-Time Crypto AI Dashboard")
-symbol = f"{selected_coin}USDT"
+st.markdown("**Made with love & AI · Live Kraken Data**")
 
-@st.cache_data(ttl=60)
-def fetch_ohlcv(symbol):
-    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=1"
-    res = requests.get(url).json()
+# Storage
+DATA_DIR = "data/crypto_ai_data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Top 7 + custom coin input
+top_coins = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "ADA/USDT", "SOL/USDT", "DOGE/USDT", "DOT/USDT"]
+selected_coin = st.selectbox("Select Coin", top_coins)
+custom_coin = st.text_input("Or Enter Custom Kraken Pair (e.g. LTC/USDT)", "")
+symbol = custom_coin if custom_coin else selected_coin
+
+# Prediction timeframe
+prediction_timedelta = st.select_slider("Predict Ahead", options=["15m", "30m", "1h", "4h"], value="1h")
+
+# Notification toggles
+with st.sidebar.expander("🔔 Discord Notification Settings"):
+    notify_buy = st.checkbox("Notify on BUY", value=True)
+    notify_sell = st.checkbox("Notify on SELL", value=True)
+    notify_hold = st.checkbox("Notify on HOLD", value=False)
+
+# Gain thresholds
+min_gain = st.slider("Scalp Min Gain (%)", 1, 50, 10)
+max_gain = st.slider("Scalp Max Gain (%)", 1, 50, 15)
+
+# TradingView chart embed
+def render_tradingview_chart(symbol):
+    base = symbol.replace("/", "").upper()
+    st.components.v1.html(f"""
+        <iframe src="https://s.tradingview.com/widgetembed/?frameElementId=tradingview_{base}&symbol=KRAKEN:{base}&interval=60&theme=dark&style=1&timezone=Etc%2FUTC&withdateranges=1"
+        width="100%" height="500" frameborder="0"></iframe>
+    """, height=500)
+
+render_tradingview_chart(symbol)
+
+# Kraken OHLC fetcher
+def get_ohlc(pair, interval=1, since=None):
+    url = f"https://api.kraken.com/0/public/OHLC?pair={pair.replace('/', '')}&interval={interval}"
+    if since:
+        url += f"&since={since}"
     try:
-        key = list(res["result"].keys())[0]
-        df = pd.DataFrame(res["result"][key], columns=[
-            'time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'
+        response = requests.get(url).json()
+        data = list(response["result"].values())[0]
+        df = pd.DataFrame(data, columns=[
+            "time", "open", "high", "low", "close", "vwap", "volume", "count"
         ])
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df.set_index('time', inplace=True)
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df.set_index("time", inplace=True)
         df = df.astype(float)
         return df
     except Exception as e:
-        st.error(f"Error fetching OHLCV: {e}")
+        st.error(f"Error fetching data: {e}")
         return pd.DataFrame()
 
-def generate_features(df):
+# Load and cache data
+@st.cache_data(ttl=60)
+def load_data(symbol, interval):
+    df = get_ohlc(symbol, interval)
+    if not df.empty:
+        df["returns"] = df["close"].pct_change()
+        df["volatility"] = df["returns"].rolling(window=10).std()
+        bb = BollingerBands(close=df["close"])
+        df["bb_upper"] = bb.bollinger_hband()
+        df["bb_lower"] = bb.bollinger_lband()
+        macd = MACD(close=df["close"])
+        df["macd"] = macd.macd()
+        df["macd_signal"] = macd.macd_signal()
+        rsi = RSIIndicator(close=df["close"])
+        df["rsi"] = rsi.rsi()
+        return df.dropna()
+    return pd.DataFrame()
+
+data = load_data(symbol, 1)
+
+# Save locally
+csv_path = os.path.join(DATA_DIR, f"{symbol.replace('/', '_')}.csv")
+if not data.empty:
+    data.to_csv(csv_path)
+
+# Features and target
+def create_features(df):
     df = df.copy()
-    df['returns'] = df['close'].pct_change()
-    df['sma_10'] = df['close'].rolling(window=10).mean()
-    df['sma_50'] = df['close'].rolling(window=50).mean()
-    df['rsi'] = compute_rsi(df['close'], 14)
-    df['macd'] = compute_macd(df['close'])
-    df = df.dropna()
-    return df
+    df["target"] = df["close"].shift(-1)
+    return df.dropna()
 
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+df_feat = create_features(data)
 
-def compute_macd(series):
-    ema12 = series.ewm(span=12, adjust=False).mean()
-    ema26 = series.ewm(span=26, adjust=False).mean()
-    return ema12 - ema26
+# Prepare for ML
+features = ["close", "rsi", "macd", "macd_signal", "bb_upper", "bb_lower", "volatility"]
+X = df_feat[features].values
+y = df_feat["target"].values
 
-def train_models(df, prediction_hours):
-    feature_df = generate_features(df)
-    X = feature_df[['close', 'returns', 'sma_10', 'sma_50', 'rsi', 'macd']].values
-    y = feature_df['close'].shift(-prediction_hours).dropna().values
+# Scale
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
 
-    # Align X and y
-    X = X[:-prediction_hours]
+# Split & generate sequences
+generator = TimeseriesGenerator(X_scaled, y, length=10, batch_size=1)
 
-    # Train RF
-    rf = RandomForestRegressor()
-    rf.fit(X, y)
+# Train model
+model = Sequential()
+model.add(LSTM(64, input_shape=(10, X_scaled.shape[1]), return_sequences=False))
+model.add(Dense(1))
+model.compile(loss="mse", optimizer="adam")
+model.fit(generator, epochs=3, verbose=0)
 
-    # Scale for LSTM
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(df[['close']].dropna())
-    gen = TimeseriesGenerator(scaled, scaled, length=20, batch_size=1)
+# Predict future price
+latest_seq = X_scaled[-10:].reshape(1, 10, X_scaled.shape[1])
+predicted_price = model.predict(latest_seq)[0][0]
+current_price = df_feat["close"].iloc[-1]
+prediction_time = df_feat.index[-1] + pd.Timedelta(minutes=prediction_time_map[predict_minutes])
 
-    model = Sequential()
-    model.add(LSTM(50, activation='relu', input_shape=(20, 1)))
-    model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(gen, epochs=5, verbose=0)
+# Signal logic
+if predicted_price > current_price * (1 + scalp_pct / 100):
+    signal = "BUY"
+elif predicted_price < current_price * (1 - scalp_pct / 100):
+    signal = "SELL"
+else:
+    signal = "HOLD"
 
-    return rf, model, scaler, feature_df
+# Price target estimation
+scalp_entry_price = current_price
+scalp_exit_price = predicted_price if signal != "HOLD" else np.nan
 
-def predict_next_price(df, rf, lstm, scaler, prediction_hours):
-    latest_features = generate_features(df).iloc[-1][['close', 'returns', 'sma_10', 'sma_50', 'rsi', 'macd']].values.reshape(1, -1)
-    rf_pred = rf.predict(latest_features)[0]
+# Notification toggle logic
+alerts_enabled = notify_buy if signal == "BUY" else notify_sell if signal == "SELL" else notify_hold
 
-    recent_close = df[['close']].dropna().values[-20:]
-    scaled_input = scaler.transform(recent_close)
-    lstm_input = scaled_input.reshape((1, 20, 1))
-    lstm_pred = scaler.inverse_transform(lstm.predict(lstm_input, verbose=0))[0][0]
-
-    hybrid_pred = (rf_pred + lstm_pred) / 2
-    return hybrid_pred
-
+# Discord webhook notification
 def send_discord_alert(signal, coin, current_price, predicted_price):
-    color = "🟢" if signal == "BUY" else "🔴" if signal == "SELL" else "🟡"
+    if not alerts_enabled:
+        return
     msg = {
-        "content": f"{color} **{signal} ALERT for {coin}**\n"
-                   f"Current Price: ${current_price:.2f}\n"
-                   f"Predicted Price: ${predicted_price:.2f}"
+        "content": f"**{signal} ALERT for {coin}**\nCurrent: ${current_price:.2f}\nPredicted: ${predicted_price:.2f}\nTarget: {prediction_time.strftime('%Y-%m-%d %H:%M:%S')}"
     }
     try:
         requests.post(DISCORD_WEBHOOK_URL, json=msg)
     except Exception as e:
         st.warning(f"Discord alert failed: {e}")
 
-# Main logic
-df = fetch_ohlcv(symbol)
-if not df.empty:
-    rf_model, lstm_model, scaler, features = train_models(df, prediction_hours)
-    predicted_price = predict_next_price(df, rf_model, lstm_model, scaler, prediction_hours)
-    current_price = df['close'].iloc[-1]
+send_discord_alert(signal, symbol, current_price, predicted_price)
 
-    # Signal logic
-    gain_pct = (predicted_price - current_price) / current_price * 100
-    if gain_pct > scalp_gain:
-        signal = "BUY"
-    elif gain_pct < -scalp_loss:
-        signal = "SELL"
-    else:
-        signal = "HOLD"
+# UI Layout
+st.markdown(f"### {symbol} Price Dashboard ({time.tzname[0]})")
+col1, col2 = st.columns(2)
+col1.metric("Current Price", f"${current_price:.2f}")
+col2.metric("AI Predicted Price", f"${predicted_price:.2f}", delta=f"{signal}")
 
-    send_discord_alert(signal, selected_coin, current_price, predicted_price)
+# TradingView Chart
+st.markdown("### Candlestick Chart")
+tradingview_symbol = f"KRAKEN:{symbol.replace('/', '')}"
+tradingview_html = f"""
+<iframe src="https://s.tradingview.com/widgetembed/?frameElementId=tradingview_{symbol}&symbol={tradingview_symbol}&interval={interval}&theme=dark&style=1&locale=en" width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
+"""
+st.components.v1.html(tradingview_html, height=500)
 
-    # Display results
-    st.markdown(f"### 💰 Current Price of {selected_coin}: **${current_price:.2f}**")
-    st.markdown(f"### 🤖 Predicted Price ({prediction_hours}h): **${predicted_price:.2f}**")
-    st.markdown(f"### 📊 AI Signal: **{signal}**")
+# Show predictions table
+st.markdown("### Recent Predictions")
+st.dataframe(pd.DataFrame({
+    "Timestamp": [prediction_time],
+    "Signal": [signal],
+    "Current Price": [current_price],
+    "Predicted Price": [predicted_price],
+    "Target Price": [scalp_exit_price],
+}).set_index("Timestamp"))
 
-    # TradingView Embed
-    st.markdown("---")
-    st.components.v1.html(f"""
-        <iframe src="https://s.tradingview.com/embed-widget/symbol-overview/?locale=en#%7B%22symbols%22%3A%5B%5B%22KRAKEN%3A{selected_coin}USDT%22%5D%5D%2C%22width%22%3A%22100%25%22%2C%22height%22%3A300%2C%22colorTheme%22%3A%22dark%22%2C%22isTransparent%22%3Afalse%7D"
-                width="100%" height="300" frameborder="0"></iframe>
-    """, height=300)
+# Local model save
+with open(MODEL_FILE, "wb") as f:
+    pickle.dump(model, f)
+with open(SCALER_FILE, "wb") as f:
+    pickle.dump(scaler, f)
 
-    # Optional: Display prediction horizon table
-    st.markdown("### 📅 Upcoming Predictions")
-    future_prices = []
-    for h in range(1, PREDICTION_HORIZON + 1):
-        pred = predict_next_price(df, rf_model, lstm_model, scaler, h)
-        future_prices.append((h, pred))
-    table = pd.DataFrame(future_prices, columns=['Hours Ahead', 'Predicted Price'])
-    st.dataframe(table.set_index('Hours Ahead'), height=250)
+# Backtesting UI (placeholder)
+st.markdown("### Backtesting")
+uploaded = st.file_uploader("Upload historical CSV to backtest", type=["csv"])
+if uploaded:
+    try:
+        df_backtest = pd.read_csv(uploaded, parse_dates=["time"])
+        st.success("Backtest data loaded.")
+        st.dataframe(df_backtest.tail())
+    except Exception as e:
+        st.error(f"Failed to read backtest data: {e}")
+
+# --- AI Retrain Button ---
+st.markdown("### Model Training")
+if st.button("Retrain AI Model"):
+    with st.spinner("Retraining..."):
+        try:
+            model.fit(X, y, epochs=10, verbose=0)
+            with open(MODEL_FILE, "wb") as f:
+                pickle.dump(model, f)
+            st.success("Model retrained and saved locally.")
+        except Exception as e:
+            st.error(f"Error during retraining: {e}")
+
+# --- Auto-Refresh every 60 seconds ---
+def should_refresh():
+    if "last_refresh" not in st.session_state:
+        st.session_state.last_refresh = time.time()
+        return False
+    elapsed = time.time() - st.session_state.last_refresh
+    if elapsed > 60:
+        st.session_state.last_refresh = time.time()
+        return True
+    return False
+
+if should_refresh():
+    st.experimental_rerun()
+
+# --- Optional Footer / Debug Info ---
+st.markdown("---")
+st.markdown(
+    "📈 Made with ❤️ using Kraken API, TradingView charts, and AI predictions. "
+    "All times shown in your local timezone."
+)
