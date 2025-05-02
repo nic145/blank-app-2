@@ -2,130 +2,120 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import time
-import os
-import pickle
-from datetime import datetime, timedelta
+import threading
+from datetime import datetime
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error
-
-# Set page configuration
-st.set_page_config(page_title="Crypto AI Dashboard", layout="wide")
 
 # Constants
-DATA_DIR = "local_data"
-os.makedirs(DATA_DIR, exist_ok=True)
-DEFAULT_COIN = "BTC/USDT"
-TOP_COINS = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT"]
-INTERVALS = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+COINS = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "LTC/USDT", "ADA/USDT", "DOT/USDT", "SOL/USDT"]
+INTERVALS = {
+    "1 Minute": "1",
+    "5 Minutes": "5",
+    "15 Minutes": "15",
+    "1 Hour": "60",
+    "4 Hours": "240",
+    "1 Day": "1440"
+}
+REFRESH_INTERVAL = 300  # seconds
+WEBHOOK_URL = "https://discord.com/api/webhooks/your_webhook_here"
 
-# Sidebar configuration
-with st.sidebar:
-    st.title("⚙️ Settings")
-    selected_coin = st.selectbox("Select Coin", TOP_COINS + ["Custom"])
-    if selected_coin == "Custom":
-        selected_coin = st.text_input("Enter custom coin (e.g., LTC/USDT)", "LTC/USDT")
+st.set_page_config("Crypto Dashboard", layout="wide")
 
-    selected_interval = st.radio("Candlestick Interval", list(INTERVALS.keys()), index=3)
-    leverage = st.slider("Leverage (x)", 1, 50, 25)
-    capital = st.number_input("Capital per Trade ($)", 100, 10000, 400, step=50)
-    show_discord = st.toggle("Enable Discord Alerts", value=False)
-    webhook_url = st.text_input("Discord Webhook URL", type="password")
+# Sidebar
+selected_coin = st.selectbox("Choose a coin", COINS)
+custom_coin = st.text_input("Or enter custom coin pair (e.g. MATIC/USDT)")
+if custom_coin:
+    selected_coin = custom_coin.upper()
+selected_interval = st.radio("Interval", list(INTERVALS.keys()), index=3, horizontal=True)
+discord_alerts = st.toggle("Send Discord BUY/SELL alerts", value=True)
+show_chart = st.toggle("Show TradingView Chart", value=False)
+threshold_percent = st.slider("Alert Threshold (%)", min_value=5, max_value=50, value=15, step=1)
 
-# Fetch data from Kraken
-def fetch_ohlcv(symbol, interval="1h", limit=200):
-    pair = symbol.replace("/", "")
-    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={INTERVALS[interval]}"
+# Main display
+st.title("📈 Crypto Prediction Dashboard")
+price_col, prediction_col = st.columns(2)
+price_col.metric("Current Price", "Loading...")
+prediction_col.metric("Predicted Price", "Loading...")
+
+@st.cache_data(ttl=300)
+def fetch_ohlcv(coin, interval):
+    pair = coin.replace("/", "")
+    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"
     try:
-        res = requests.get(url).json()
-        key = list(res["result"].keys())[0]
-        ohlcv = res["result"][key]
-        df = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "VWAP", "Volume", "Count"])
+        r = requests.get(url)
+        data = list(r.json()["result"].values())[0]
+        df = pd.DataFrame(data, columns=["Time", "Open", "High", "Low", "Close", "Vwap", "Volume", "Count"])
         df["Time"] = pd.to_datetime(df["Time"], unit="s")
-        df.set_index("Time", inplace=True)
-        df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
-        return df.tail(limit)
+        df["Close"] = pd.to_numeric(df["Close"])
+        return df
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Data error: {e}")
         return pd.DataFrame()
 
-# Load model from disk
 @st.cache_resource
-def load_model():
-    try:
-        with open(f"{DATA_DIR}/model.pkl", "rb") as f:
-            model = pickle.load(f)
-        with open(f"{DATA_DIR}/scaler.pkl", "rb") as f:
-            scaler = pickle.load(f)
-        return model, scaler
-    except:
-        return None, None
-
-# Save model
-def save_model(model, scaler):
-    with open(f"{DATA_DIR}/model.pkl", "wb") as f:
-        pickle.dump(model, f)
-    with open(f"{DATA_DIR}/scaler.pkl", "wb") as f:
-        pickle.dump(scaler, f)
-
-# Train model
 def train_model(df):
-    df["Return"] = df["Close"].pct_change()
-    df.dropna(inplace=True)
-    features = df[["Close", "Volume"]].values
-    target = df["Close"].shift(-1).dropna().values
-
+    df = df[["Close"]]
     scaler = MinMaxScaler()
-    scaled_features = scaler.fit_transform(features[:-1])
-
-    model = RandomForestRegressor()
-    model.fit(scaled_features, target)
+    df_scaled = scaler.fit_transform(df)
+    X, y = [], []
+    for i in range(60, len(df_scaled)):
+        X.append(df_scaled[i-60:i, 0])
+        y.append(df_scaled[i, 0])
+    X, y = np.array(X), np.array(y)
+    model = RandomForestRegressor(n_estimators=100)
+    model.fit(X, y)
     return model, scaler
 
-# Predict next price
 def predict_price(model, scaler, df):
-    last_data = df[["Close", "Volume"]].iloc[-1:].values
-    scaled = scaler.transform(last_data)
-    return model.predict(scaled)[0] if model else None
+    last_60 = df["Close"].values[-60:]
+    scaled = scaler.transform(last_60.reshape(-1, 1))
+    X = scaled.reshape(1, -1)
+    pred_scaled = model.predict(X)
+    predicted_price = scaler.inverse_transform(pred_scaled.reshape(-1, 1))[0][0]
+    return round(predicted_price, 2)
 
-# Display dashboard
-df = fetch_ohlcv(selected_coin, selected_interval)
+def send_discord_alert(signal, coin, price):
+    if discord_alerts:
+        message = {
+            "content": f"📢 **{signal} Signal** for `{coin}` at price **${price:.2f}**"
+        }
+        try:
+            requests.post(WEBHOOK_URL, json=message)
+        except:
+            st.warning("Failed to send Discord alert.")
+
+def show_tradingview_chart(symbol):
+    tv_symbol = symbol.replace("/", "")
+    st.components.v1.html(f'''
+        <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=KRAKEN:{tv_symbol}" 
+                width="100%" height="500" frameborder="0"></iframe>
+    ''', height=500)
+
+# Load data and model
+df = fetch_ohlcv(selected_coin, INTERVALS[selected_interval])
 if not df.empty:
-    st.markdown(f"### {selected_coin} — Interval: {selected_interval}")
-    st.line_chart(df["Close"])
+    def model_thread_func():
+        global model, scaler
+        model, scaler = train_model(df)
 
-    model, scaler = load_model()
-    if model and scaler:
-        pred = predict_price(model, scaler, df)
-        latest_price = df["Close"].iloc[-1]
-        signal = "BUY" if pred > latest_price else "SELL" if pred < latest_price else "HOLD"
-        st.metric("Current Price", f"${latest_price:,.2f}")
-        st.metric("Predicted Price", f"${pred:,.2f}" if pred else "N/A")
-        st.metric("Signal", signal)
-        
-        # Simulated PnL
-        change = ((pred - latest_price) / latest_price) * 100
-        pnl = (change / 100) * capital * leverage * (1 if signal == "BUY" else -1)
-        st.markdown(f"**Simulated PnL (@{leverage}x on ${capital}):** ${pnl:.2f}")
+    model_thread = threading.Thread(target=model_thread_func)
+    model_thread.start()
+    model_thread.join()
 
-        if show_discord and webhook_url and signal in ["BUY", "SELL"]:
-            msg = {
-                "content": f"**{signal} Signal for {selected_coin}**\nPrice: ${latest_price:.2f}\nPrediction: ${pred:.2f}\nSimulated PnL: ${pnl:.2f}"
-            }
-            try:
-                requests.post(webhook_url, json=msg)
-                st.success("Discord alert sent.")
-            except:
-                st.warning("Failed to send Discord alert.")
-    else:
-        st.info("Model not trained yet.")
+    predicted_price = predict_price(model, scaler, df)
+    current_price = df["Close"].iloc[-1]
+    change_percent = ((predicted_price - current_price) / current_price) * 100
 
-    if st.button("Train Model Now"):
-        with st.spinner("Training model..."):
-            model, scaler = train_model(df)
-            save_model(model, scaler)
-            st.success("Model trained and cached. Reloading...")
-            st.rerun()
+    price_col.metric("Current Price", f"${current_price:.2f}")
+    prediction_col.metric("Predicted Price", f"${predicted_price:.2f}", delta=f"{change_percent:.2f}%")
+
+    if change_percent >= threshold_percent:
+        send_discord_alert("BUY", selected_coin, predicted_price)
+    elif change_percent <= -threshold_percent:
+        send_discord_alert("SELL", selected_coin, predicted_price)
+
+    if show_chart:
+        show_tradingview_chart(selected_coin)
 else:
     st.warning("No data to display.")
